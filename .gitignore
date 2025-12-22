@@ -1,0 +1,6 @@
+# 忽略 Hugo 执行文件
+hugo.exe
+
+# 忽略本地生成的静态网页文件夹（我们用 GitHub Actions 云端生成，不需要传本地的）
+public/
+resources/
