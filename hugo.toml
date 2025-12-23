@@ -2,3 +2,6 @@ baseURL = 'http://example.org/'
 languageCode = 'zh-cn'
 title = '我的技术博客'
 theme = 'PaperMod'
+
+[params]
+    mermaid = true
