@@ -69,7 +69,7 @@ DROP INDEX idx_conversation ON messages;
 *   **优化前**：~150 ms
 *   **优化后**：~0.08 ms
 *   **提升幅度**：约 2000 倍
-![sql_optimization_before_explain](/images/sql_optimization_before_explain.png)
+![sql_optimization_after_explain](/images/sql_optimization_after_explain.png)
 #### 4.2 深入验证 (EXPLAIN ANALYZE)
 为了确认 MySQL 确实只扫描了 20 行（而不是 EXPLAIN 估算的 15 万行），使用 `EXPLAIN ANALYZE` 查看实际执行路径：
 ![sql_optimization_after_explain_analyze](/images/sql_optimization_after_explain_analyze.png)
