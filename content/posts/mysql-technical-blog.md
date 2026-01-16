@@ -29,6 +29,10 @@ MySQL 支持插件式存储引擎，常用引擎对比：
 | **MyISAM** | ✗ | 表锁 | 只读或读多写少 |
 | **Memory** | ✗ | 表锁 | 临时表、缓存 |
 
+**InnoDB architecture**
+
+![Innodb-architecture](/images/innodb-architecture-8-0.png)
+
 ---
 
 ## 二、索引机制
