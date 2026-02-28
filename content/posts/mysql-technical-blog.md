@@ -1,4 +1,4 @@
-+++
+﻿+++
 date = '2026-01-15T02:27:08+08:00'
 draft = false
 title = 'Mysql Technical Blog'
@@ -60,6 +60,22 @@ MySQL 支持插件式存储引擎，常用引擎对比：
 **按字段数量：**
 - **单列索引**：单个字段
 - **联合索引**：多个字段组合，遵循最左前缀原则
+
+### 2.3 普通索引 vs 唯一索引
+
+- 普通索引可利用 **Change Buffer** 优化写入，数据不在内存时直接写入 Change Buffer
+- 唯一索引必须读取数据页判断唯一性，无法使用 Change Buffer
+- 写入 Change buffer, 避免加载冷数据（按页加载，即使修改一个数据，也至少加载16kb）挤出热点数据，造成**Buffer Pool Pollution**
+
+### 2.4 优化器选错索引的处理
+
+```sql
+-- 重新统计索引信息
+ANALYZE TABLE t;
+
+-- 强制使用指定索引
+SELECT * FROM t FORCE INDEX(idx_name) WHERE name = 'test';
+```
 
 ---
 
@@ -165,6 +181,10 @@ InnoDB 行锁的加锁规则：
 | **Row** | 记录行变更，日志量大，主从一致性好 |
 | **Mixed** | 自动选择，默认 Statement，特殊情况用 Row |
 
+InnoDB crash 的本质是：内存中的脏页没刷盘，Binlog不记录物理级别的数据页修改进度，一条sql语句涉及多个数据页(数据，索引，页分裂)修改，crash恢复时不知道哪些数据页更新了，所以不支持 crash recovery。
+
+Redo Log 具有LSN（Log Sequence Number），一个全局递增的日志位置编号，用来标记“日志写到了哪里”。
+
 ### 5.3 两阶段提交
 
 为保证 Redo Log 和 Binlog 数据一致性，采用两阶段提交：
@@ -180,6 +200,10 @@ InnoDB 使用 Doublewrite Buffer 解决部分页写入（Partial Page Write）�
 1. 先将脏页写入 Doublewrite Buffer（顺序写）
 2. 再将脏页写入数据文件（随机写）
 3. 崩溃恢复时，若数据页损坏，可从 Doublewrite Buffer 恢复
+
+> redolog：一个sql语句修改多个数据页，redolog 记录哪些数据页修改了，哪些没修改。
+>
+> doublewrote：一个数据页对应四个 linux 页，doublewrite 保证一个数据页不会出现部分写入。
 
 ---
 
@@ -199,7 +223,7 @@ InnoDB 使用 Doublewrite Buffer 解决部分页写入（Partial Page Write）�
 
 - 从库机器性能较差
 - 从库承担过多查询压力
-- 大事务执行时间长
+- 大事务执行时间长(delete大量数据,大表DDL(gh-ost解决))
 - 网络延迟
 
 ### 6.3 处理过期读
@@ -215,11 +239,37 @@ InnoDB 使用 Doublewrite Buffer 解决部分页写入（Partial Page Write）�
 
 ---
 
-## 七、性能优化
+## 七、查询执行分析
 
 ### 7.1 执行计划分析（EXPLAIN）
 
 ![Explain](/images/explain.png)
+
+**Explain extra 字段解释**
+
+- Using index: 使用了覆盖索引，避免回表查询
+
+- Using filesort: order by 后面的字段没有索引，分为全字段排序和 rowid 排序
+
+- Using index condition: 使用了索引下推（index conditionpushdown）,利用二级索引提前过滤，减少回表次数。
+
+  ```sql
+  (age,city)
+  select * from tb where age>5 and city="aaa" and name = "abc";
+  -- age可以用到索引,city用到索引下推，回表之前就过滤到部分数据。
+  ```
+
+- Using join buffer: Block Nested Loop，Batched-key access(BKA)
+
+- Using MRR: 用到 Multi-Range Read 优化，批量回表查询，以id递增顺序回表以实现顺序读。
+
+  ```sql
+  (a)
+  select * from tb where a>5 and a<10;
+  -- 根据索引a得到一些结果，根据id排序，按id递增的方式回表查询
+  ```
+
+- Using temporary: union 或 group by
 
 ### 7.2 慢查询诊断
 
@@ -232,6 +282,7 @@ SELECT * FROM sys.innodb_lock_waits;
 ```
 
 **查询长时间不返回的原因：**
+
 - 等待 MDL（Metadata Lock）
 - 等待 Flush
 - 等待行锁
@@ -242,46 +293,18 @@ SELECT * FROM sys.innodb_lock_waits;
 - 索引选择不当
 - 客户端接收慢（MySQL 边读边发，导致 `net_buffer` 阻塞）
 
-### 7.3 索引优化
-
-**普通索引 vs 唯一索引：**
-- 普通索引可利用 **Change Buffer** 优化写入，数据不在内存时直接写入 Change Buffer
-- 唯一索引必须读取数据页判断唯一性，无法使用 Change Buffer
-
-**优化器选错索引的处理：**
-```sql
--- 重新统计索引信息
-ANALYZE TABLE t;
-
--- 强制使用指定索引
-SELECT * FROM t FORCE INDEX(idx_name) WHERE name = 'test';
-```
-
-### 7.4 性能抖动原因
-
-- Redo Log 写满，触发 Checkpoint 刷脏页
-- Buffer Pool 满，淘汰脏页需先刷盘
-- 后台线程定期刷脏页
-
-**Buffer Pool LRU 优化**
-
-InnoDB 采用改进的 LRU 算法（Young 区:Old 区 = 5:3）防止缓存污染：
-1. 新数据先放入 Old 区域
-2. 在 Old 区域停留超过 `innodb_old_blocks_time` 后再次访问，才移入 Young 区域
-3. 防止全表扫描等操作将热点数据挤出缓存
-
-### 7.5 JOIN 算法
+### 7.3 JOIN 算法
 
 | 算法 | 条件 | 特点 |
 |------|------|------|
-| **Index Nested-Loop Join** | 被驱动表连接字段有索引 | 性能好，复杂度 O(N×logM) |
-| **Block Nested-Loop Join** | 无索引，使用 Join Buffer | MySQL 8.0.18 前使用 |
+| **Index Nested-Loop Join** | 被驱动表连接字段有索引 | 性能好，复杂度 O(NlogM) |
+| **Block Nested-Loop Join** | 无索引，使用 Join Buffer | 大表BNL导致热数据淘汰 |
 | **Hash Join** | MySQL 8.0.18+ 无索引时自动使用 | 替代 BNL，性能更好 |
 
 - **MRR**：将随机 I/O 转为顺序 I/O，先读取索引排序后再回表
-- **BKA**：基于 MRR，批量将驱动表数据传递给被驱动表查询
+- **BKA**：用到 join buffer，`NLJ->BKA`（在被驱动表建立索引，如果不适合建立索引，就使用临时表，在临时表上建立索引），基于 MRR，批量将驱动表数据传递给被驱动表查询
 
-### 7.6 ORDER BY 优化
+### 7.4 ORDER BY 优化
 
 **最优情况**：利用索引有序性，EXPLAIN 不出现 `Using filesort`。
 
@@ -294,17 +317,41 @@ InnoDB 采用改进的 LRU 算法（Young 区:Old 区 = 5:3）防止缓存污染
 
 > MySQL 根据 `max_length_for_sort_data` 自动选择：行宽超过该值时使用 Rowid 排序。
 
-### 7.7 外部排序
+### 7.5 外部排序
 
 当 Sort Buffer 不足时，MySQL 使用外部排序：
 - **归并排序**：分批排序写入临时文件，最后多路归并
 - **优先队列**：`ORDER BY ... LIMIT N` 场景，维护 N 个元素的堆，避免全量排序
 
+### 7.6 内存数据结构与临时表选择
+
+- 如果语句执行过程可以一边读数据，一边直接得到结果，不需要额外内存来保存中间结果；
+
+- **join_buffer** 是无序数组，**sort_buffer** 是有序数组，**临时表**是二维表结构
+- 如果执行逻辑需要用到二维表特性，就会优先考虑使用临时表。
+
 ---
 
-## 八、常见问题与解决方案
+## 八、Buffer Pool 与刷脏页
 
-### 8.1 删除数据不释放空间
+### 8.1 性能抖动原因
+
+- Redo Log 写满，触发 Checkpoint 刷脏页
+- Buffer Pool 满，淘汰脏页需先刷盘
+- 后台线程定期刷脏页
+
+### 8.2 Buffer Pool LRU 优化
+
+InnoDB 采用改进的 LRU 算法（Young 区:Old 区 = 5:3）防止缓存污染：
+1. 新数据先放入 Old 区域
+2. 在 Old 区域停留超过 `innodb_old_blocks_time` 后再次访问，才移入 Young 区域
+3. 防止全表扫描等操作将热点数据挤出缓存
+
+---
+
+## 九、常见问题与解决方案
+
+### 9.1 删除数据不释放空间
 
 ```sql
 -- DELETE 仅标记删除，空间不会立即释放
@@ -314,23 +361,23 @@ DELETE FROM t WHERE create_time < '2024-01-01';
 ALTER TABLE t ENGINE = InnoDB;
 ```
 
-### 8.2 COUNT 性能
+### 9.2 COUNT 性能
 
 性能从低到高：`count(字段)` < `count(id)` < `count(1)` ≈ `count(*)`
 
 > `count(*)` 经过优化器特殊优化，推荐使用。
 
-### 8.3 临时表
+### 9.3 临时表
 
 触发场景：`UNION` 去重、`GROUP BY` 无索引、复杂子查询。
 
-### 8.4 分区表
+### 9.4 分区表
 
 分区表在引擎层分区，对业务透明。优势：`ALTER TABLE t DROP PARTITION p_2023` 比 `DELETE` 更快。
 
 适用场景：按时间分区的日志表、历史数据表。
 
-### 8.5 数据迁移
+### 9.5 数据迁移
 
 | 方式 | 特点 |
 |------|------|
