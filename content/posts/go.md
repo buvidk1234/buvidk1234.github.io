@@ -1,6 +1,6 @@
 +++
 date = '2026-03-02T17:44:21+08:00'
-draft = true
+draft = false
 title = 'Go'
 +++
 
@@ -40,8 +40,56 @@ func nextslicecap(newLen, oldCap int) int {
 }
 ```
 ## Map
-未完待续。。。
+
+```go
+type Map struct {
+	
+	used uint64 // The number of filled slots
+	seed uintptr // the hash seed, computed as a unique random number per map.
+
+	// The directory of tables.
+	// Normally dirPtr points to an array of table pointers
+	// dirPtr *[dirLen]*table
+	dirPtr unsafe.Pointer
+    
+	dirLen int // 1 << globalDepth
+	globalDepth uint8 // The number of bits to use in table directory lookups.
+	globalShift uint8 // The number of bits to shift out, 64 - globalDepth
+	writing uint8 // detect the race.
+	tombstonePossible bool // whether a table in this map contains a tombstone.
+	clearSeq uint64 // version number, used to detect map clears during iteration.
+}
+
+```
+
+### Swiss Table
+> refer: [Faster Go maps with Swiss Tables](https://golang.google.cn/blog/swisstable)
+
+![swiss table](/images/swiss_table.png)
+
+插入过程：
+
+1. 计算 `hash(key)` 并将其分成两部分：高 57 位（称为 `h1`）和低 7 位（称为 `h2`）。
+2. 高位（`h1`）用于选择要考虑的第一个组：在本例中为 `h1 % 2`，因为只有 2 个组。
+3. 在一个组内，所有槽都有可能容纳该键。我们必须首先确定是否有槽已包含此键，在这种情况下，这是一个更新而不是新的插入。（SIMD）
+4. 如果没有槽包含该键，那么我们寻找一个空槽来放置该键。
+5. 如果没有空槽，则继续探测序列，搜索下一个组。
+
+### 增量式增长
+> refer: [Extendible hashing](https://en.wikipedia.org/wiki/Extendible_hashing)
+
+将每个 Map 分成多个 Swiss Tables。每个 Map 由一个或多个独立表组成，这些表覆盖键空间的一部分，而不是由一个 Swiss Table 实现整个 Map。单个表最多存储 1024 个条目。哈希中可变数量的高位用于选择键所属的表。（可扩展哈希）
+
+### 迭代期间的修改
+
+迭代期间可修改
+
+- 如果在到达条目之前删除该条目，则不会生成该条目。
+- 如果在到达条目之前更新该条目，则会生成更新后的值。
+- 如果添加了新条目，则可能生成也可能不生成。
+
 ## Channel
+
 ```go
 type hchan struct {
 	qcount   uint           // total data in the queue
@@ -324,14 +372,199 @@ sclose:
 ## Sync
 ### Mutex
 ```go
+// 互斥锁的公平性。
+//
+// 互斥锁有两种工作模式：正常模式（normal）和饥饿模式（starvation）。
+// 在正常模式下，等待者（waiters）按 FIFO 顺序排队，但被唤醒的等待者
+// 并不会直接拥有互斥锁，而是需要与新到达的 goroutine 竞争锁的所有权。
+// 新到达的 goroutine 有优势——它们已经在 CPU 上运行，而且可能有很多个，
+// 因此被唤醒的等待者很有可能竞争失败。在这种情况下，它会被重新放回
+// 等待队列的队首。如果一个等待者在超过 1ms 的时间内仍未能获得互斥锁，
+// 则会将互斥锁切换到饥饿模式。
+//
+// 在饥饿模式下，互斥锁的所有权会由解锁的 goroutine
+// 直接移交给等待队列最前面的等待者。
+// 新到达的 goroutine 即使看到锁似乎已经解锁，也不会尝试获取锁，
+// 也不会进行自旋；相反，它们会把自己加入到等待队列的尾部。
+//
+// 如果某个等待者获得了互斥锁，并且发现以下任一情况成立：
+// (1) 它是队列中的最后一个等待者；或者
+// (2) 它等待的时间少于 1ms，
+// 那么它会将互斥锁切换回正常模式。
+//
+// 正常模式的性能要好得多，因为即使有被阻塞的等待者，
+// 某个 goroutine 仍然可能连续多次获取同一个互斥锁。
+// 而饥饿模式对于防止某些极端情况下的尾延迟（tail latency）问题非常重要。
+const (
+    mutexLocked = 1 << iota // bit0: 是否已加锁
+    mutexWoken              // bit1: 是否已有被唤醒的等待者
+    mutexStarving           // bit2: 是否处于饥饿模式
+    mutexWaiterShift = iota // 从 bit3 开始存等待者数量
+)
 type Mutex struct {
 	state int32
 	sema  uint32
 }
-```
-正常模式：非公平锁
 
-饥饿模式：有协程很长时间未获得锁，变成饥饿模式
+func (m *Mutex) Lock() {
+	// Fast path: grab unlocked mutex.
+	if atomic.CompareAndSwapInt32(&m.state, 0, mutexLocked) {
+		if race.Enabled {
+			race.Acquire(unsafe.Pointer(m))
+		}
+		return
+	}
+	// Slow path (outlined so that the fast path can be inlined)
+	m.lockSlow()
+}
+
+func (m *Mutex) lockSlow() {
+	var waitStartTime int64 // 开始排队等待的时间
+	starving := false       // 是否因为等待时间过长而处于“饥饿”状态
+	awoke := false          // 是否是刚从沉睡（等待队列）中被唤醒的
+	iter := 0               // 尝试自旋（Spin）的次数
+	old := m.state          // 记录互斥锁当前的状态
+
+	// 进入一个死循环，不断尝试获取锁或者挂起自己
+	for {
+		// ==========================================
+		// 第一阶段：尝试自旋 (Spinning)，这是一种乐观等待机制
+		// 只有在满足以下所有条件时才会自旋：
+		// 1. 锁当前被占用 (mutexLocked == 1)
+		// 2. 锁没有处于饥饿模式 (mutexStarving == 0)。饥饿模式下绝对不允许自旋插队。
+		// 3. 当前的 CPU 状态允许自旋 (runtime_canSpin)。比如多核且有空闲的 P，且自旋次数不足 4 次。
+		// ==========================================
+		if old&(mutexLocked|mutexStarving) == mutexLocked && runtime_canSpin(iter) {
+			
+			// 在自旋的过程中，如果当前 goroutine 没有被打上"已唤醒"标记，
+			// 且锁的"已唤醒"标志位还没有被别人设置，而且等待队列里确实有其他人正在排队，
+			// 那么当前 goroutine 就尝试用 CAS 把锁的状态标记为"已唤醒" (mutexWoken)。
+			// 为什么要这样做？
+			// 这是为了告诉当前正在持有锁的那个 goroutine："嘿，我就在这里盯着呢(在CPU上空转)，
+			// 你一会儿释放锁的时候直接走人就行，千万别再去慢吞吞地唤醒队列里的老实人了，把锁留给我就行！"
+			if !awoke && old&mutexWoken == 0 && old>>mutexWaiterShift != 0 &&
+				atomic.CompareAndSwapInt32(&m.state, old, old|mutexWoken) {
+				awoke = true
+			}
+			
+			runtime_doSpin() // 执行底层汇编 CPU PAUSE 指令，让出几个时钟周期，但不让出线程
+			iter++           // 增加自旋次数
+			old = m.state    // 刷新锁的旧状态，看看主人在自旋期间是不是把锁释放了
+			continue         // 继续这轮抢锁尝试
+		}
+
+		// ==========================================
+		// 第二阶段：走到这里，说明要么没资格自旋，要么自旋结束了（无论持锁者是否已释放锁）。
+		// 我们需要基于目前的旧状态 old，推算出我们期望锁变成的新状态 new。
+		// ==========================================
+		new := old
+		
+		// 1. 如果当前不是饥饿模式，说明大家公平竞争，那么新来的或刚醒的 goroutine 就可以尝试设置加锁标志位！
+		if old&mutexStarving == 0 {
+			new |= mutexLocked
+		}
+		
+		// 2. 如果锁当前被占用，或者正处于不能插队的"饥饿模式"
+		// 那么当前 goroutine 没有任何取巧办法，只能乖乖去排队（将 Waiter 等待者的数量 +1）
+		if old&(mutexLocked|mutexStarving) != 0 {
+			new += 1 << mutexWaiterShift
+		}
+		
+		// 当前线程饥饿，锁仍被占用
+		if starving && old&mutexLocked != 0 {
+			new |= mutexStarving
+		}
+		
+		// 4. 清除唤醒标志位：如果当前 goroutine 之前被标记为 awoke (不管是自旋设置的还是被唤醒的)
+		if awoke {
+			// 将 Woken 标志位清零（因为当前 goroutine 已经"醒了"，使命完成了）
+			new &^= mutexWoken
+		}
+
+		// ==========================================
+		// 第三阶段：尝试使用 CAS 原语，把算好的期望新状态 new 替换掉实际的锁状态。
+		// ==========================================
+		if atomic.CompareAndSwapInt32(&m.state, old, new) {
+			
+			// 如果旧状态既没有被锁死，也不处于饥饿模式 -> CAS抢到了一个空闲的锁
+			if old&(mutexLocked|mutexStarving) == 0 {
+				break
+			}
+			
+			// 走到这，说明 CAS 虽然成功修改了状态（比如成功给自己排上了队，或者成功把锁打上了饥饿标记），
+			// 但是并没有抢到锁的所有权。接下来只能去睡觉（阻塞挂起）了。
+
+			queueLifo := waitStartTime != 0 // 排到最前面
+			if waitStartTime == 0 {
+				waitStartTime = runtime_nanotime() // 新来的，记录一下开始排队的时间点
+			}
+			
+			// 将自己挂起，让出 P，陷入沉睡，等待被别人通过信号量唤醒...
+			runtime_SemacquireMutex(&m.sema, queueLifo, 2)
+
+			// 当前 goroutine 被某一个释放锁的人唤醒了！
+
+			// 醒来后，计算等待时间(1ms)，是否饥饿
+			starving = starving || runtime_nanotime()-waitStartTime > starvationThresholdNs
+			old = m.state // 醒来时刻锁状态
+
+			// 关键判断：目前锁处于什么模式？
+			if old&mutexStarving != 0 {
+				// 【逻辑分支 A：锁已经处于饥饿模式！】
+				// 锁直接给了当前线程
+				
+				// 既然我拿到了锁，那就需要修正状态：加上 Locked 标志，减去 Waiter 人数 1
+				delta := int32(mutexLocked - 1<<mutexWaiterShift)
+				
+				// 如果我不饿（等待没超过1ms），队列只有我自己，关闭饥饿模式
+				if !starving || old>>mutexWaiterShift == 1 {
+					delta -= mutexStarving
+				}
+				
+				// 通过原子操作应用这些修正逻辑
+				atomic.AddInt32(&m.state, delta)
+				break // 拿到锁，跳出死循环
+			}
+			
+			// 【逻辑分支 B：锁处于正常模式】
+			// 被唤醒，锁处于正常模式，需要与刚刚来抢锁的那些正在 CPU 上活蹦乱跳的 goroutine 公平竞争
+			awoke = true // 标记是刚醒的（这样在上面第二阶段就可以清除锁的 Woken 标记）
+			iter = 0     // 经历了一次沉睡，重新开始清算自旋次数
+			
+			// 回到 for 循环的头部，刚唤醒需要线程调度优劣势，和那些新来的线程抢锁。
+		} else {
+			// CAS 失败了，说明在计算 new 的过程中，有其他 goroutine 修改了锁的状态。
+			// 刷新 old 为最新的状态，回到 for 循环重新再计算一次期望的状态 new。
+			old = m.state 
+		}
+	}
+}
+
+```
+
+
+### RWMutex
+```go
+// A RWMutex is a reader/writer mutual exclusion lock.
+// The lock can be held by an arbitrary number of readers or a single writer.
+// The zero value for a RWMutex is an unlocked mutex.
+//
+// If any goroutine calls [RWMutex.Lock] while the lock is already held by
+// one or more readers, concurrent calls to [RWMutex.RLock] will block until
+// the writer has acquired (and released) the lock, to ensure that
+// the lock eventually becomes available to the writer.
+// Note that this prohibits recursive read-locking.
+// A [RWMutex.RLock] cannot be upgraded into a [RWMutex.Lock],
+// nor can a [RWMutex.Lock] be downgraded into a [RWMutex.RLock].
+//
+type RWMutex struct {
+	w           Mutex        // held if there are pending writers
+	writerSem   uint32       // semaphore for writers to wait for completing readers
+	readerSem   uint32       // semaphore for readers to wait for completing writers
+	readerCount atomic.Int32 // number of pending readers
+	readerWait  atomic.Int32 // number of departing readers
+}
+```
 ### Once
 ```go
 type Once struct {
@@ -384,6 +617,108 @@ type HashTrieMap[K comparable, V any] struct {
 	seed     uintptr
 }
 ```
+## 内存模型
+> 参考 [The Go Memory Model](https://go.dev/ref/mem)
+
+### Happens-Before
+Go内存模型定义了在什么条件下，一个goroutine对变量的写入能被另一个goroutine的读取观察到。
+
+**数据竞争(data race)**：对同一内存位置的写操作与另一个读/写操作并发执行，且至少有一个不是原子操作。无数据竞争的程序表现为所有goroutine在单处理器上顺序执行（DRF-SC）。
+
+**Happens-before** 是 sequenced before（同一goroutine内的程序顺序）和 synchronized before（跨goroutine的同步关系）的传递闭包。对于普通读操作 r，它读取到的值必须是某个对 r **可见**的写操作 w 所写的值——即 w happens before r，且在 w 和 r 之间没有其他写操作。
+
+### 同步保证
+
+**初始化**：包 p 导入包 q，则 q 的 `init` 函数完成 *synchronized before* p 的 `init` 开始。所有 `init` 完成 *synchronized before* `main.main` 开始。
+
+**Goroutine 创建**：`go` 语句 *synchronized before* 新goroutine执行开始。
+```go
+var a string
+func f() { print(a) }
+func hello() {
+	a = "hello, world"
+	go f() // 保证能打印 "hello, world"
+}
+```
+
+**Goroutine 销毁**：goroutine的退出**不保证** *synchronized before* 程序中的任何事件，必须使用同步机制。
+
+**Channel 通信**：
+- 向channel发送 *synchronized before* 对应的接收完成
+- channel关闭 *synchronized before* 因关闭而收到零值的接收
+- **无缓冲channel**：接收 *synchronized before* 对应的发送完成
+- 容量为C的channel上第k次接收 *synchronized before* 第k+C次发送完成（可用于限流信号量）
+
+```go
+var c = make(chan int)
+var a string
+func f() {
+	a = "hello, world"
+	<-c
+}
+func main() {
+	go f()
+	c <- 0     // 无缓冲: 接收 synchronized before 发送完成
+	print(a)   // 保证打印 "hello, world"
+}
+```
+
+**Locks**：对于 `sync.Mutex`/`sync.RWMutex` 变量 l，第n次 `l.Unlock()` *synchronized before* 第m次 `l.Lock()` 返回（n < m）。
+
+**Once**：`once.Do(f)` 中 f() 的完成 *synchronized before* 任何 `once.Do(f)` 调用的返回。
+
+**Atomic**：如果原子操作A的效果被原子操作B观察到，则A *synchronized before* B。所有原子操作表现为某种顺序一致的全序。
+
+### 错误的同步
+```go
+// ❌ 双重检查锁定 - 观察到done=true不意味着能观察到a的写入
+var a string
+var done bool
+func setup() {
+	a = "hello, world"
+	done = true
+}
+func doprint() {
+	if !done {
+		once.Do(setup)
+	}
+	print(a) // 可能打印空字符串！
+}
+```
+```go
+// ❌ 忙等待 - 不保证能观察到done的写入，循环可能永不结束
+var a string
+var done bool
+func setup() {
+	a = "hello, world"
+	done = true
+}
+func main() {
+	go setup()
+	for !done {
+	}
+	print(a) // 可能打印空字符串，甚至死循环
+}
+```
+```go
+// ❌ 指针观察 - 即使观察到g!=nil，也不保证能观察到g.msg的初始化
+type T struct { msg string }
+var g *T
+func setup() {
+	t := new(T)
+	t.msg = "hello, world"
+	g = t
+}
+func main() {
+	go setup()
+	for g == nil {
+	}
+	print(g.msg) // 可能打印空字符串
+}
+```
+
+以上错误的根本原因都是缺少显式同步，应使用channel、mutex、atomic等同步原语建立happens-before关系。
+
 ## Context
 ```go
 type Context interface {
