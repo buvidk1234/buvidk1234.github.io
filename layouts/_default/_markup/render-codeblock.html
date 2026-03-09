@@ -1,0 +1,11 @@
+{{- $lang := .Type | default "text" -}}
+{{- $summary := printf "%s code" (upper $lang) -}}
+{{- with .Attributes -}}
+  {{- with index . "summary" -}}
+    {{- $summary = . -}}
+  {{- end -}}
+{{- end -}}
+<details class="code-fold">
+  <summary>{{- $summary -}}</summary>
+  {{- highlight .Inner $lang .Options -}}
+</details>

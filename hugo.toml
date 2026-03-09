@@ -27,3 +27,8 @@ theme = 'PaperMod'
         name = 'Tags'
         url = '/tags/'
         weight = 30
+
+[markup]
+    [markup.highlight]
+        noClasses = true
+        style = 'github'

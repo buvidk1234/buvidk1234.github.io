@@ -1,3 +1,44 @@
 body {
     font-size: 16px;
 }
+
+/* GitHub-like light code block style */
+.post-content .highlight:not(table) {
+    background: #f6f8fa !important;
+    border: 1px solid #d0d7de;
+}
+
+.post-content .highlight pre[style] {
+    color: #24292f !important;
+    background: #f6f8fa !important;
+}
+
+.post-content pre code {
+    color: #24292f;
+    background: #f6f8fa !important;
+}
+
+/* Collapsible code blocks for long snippets */
+.post-content details.code-fold {
+    margin: 12px 0;
+    border: 1px solid #d0d7de;
+    border-radius: var(--radius);
+    background: #f6f8fa;
+}
+
+.post-content details.code-fold > summary {
+    padding: 10px 14px;
+    font-size: 14px;
+    color: #57606a;
+    cursor: pointer;
+    user-select: none;
+}
+
+.post-content details.code-fold[open] > summary {
+    border-bottom: 1px solid #d0d7de;
+}
+
+.post-content details.code-fold .highlight {
+    margin: 0;
+    border-radius: 0 0 var(--radius) var(--radius);
+}
