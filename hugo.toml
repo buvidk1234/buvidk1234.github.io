@@ -5,3 +5,25 @@ theme = 'PaperMod'
 
 [params]
     mermaid = true
+
+[outputs]
+    home = ['HTML', 'RSS', 'JSON']
+
+[menu]
+    [[menu.main]]
+        identifier = 'archives'
+        name = 'Archive'
+        url = '/archives/'
+        weight = 10
+
+    [[menu.main]]
+        identifier = 'search'
+        name = 'Search'
+        url = '/search/'
+        weight = 20
+
+    [[menu.main]]
+        identifier = 'tags'
+        name = 'Tags'
+        url = '/tags/'
+        weight = 30
