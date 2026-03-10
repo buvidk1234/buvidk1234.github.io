@@ -5,6 +5,7 @@ theme = 'PaperMod'
 
 [params]
     mermaid = true
+    math = true
 
 [outputs]
     home = ['HTML', 'RSS', 'JSON']
@@ -32,3 +33,10 @@ theme = 'PaperMod'
     [markup.highlight]
         noClasses = true
         style = 'github'
+    [markup.goldmark]
+        [markup.goldmark.extensions]
+            [markup.goldmark.extensions.passthrough]
+                enable = true
+                [markup.goldmark.extensions.passthrough.delimiters]
+                    block = [['$$', '$$'], ['\[', '\]']]
+                    inline = [['$', '$'], ['\(', '\)']]
