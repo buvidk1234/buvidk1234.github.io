@@ -1,6 +1,43 @@
 body {
     font-size: 16px;
+    line-height: 1.6;
 }
+
+.post-content h1,
+.post-content h2,
+.post-content h3,
+.post-content h4,
+.post-content h5 {
+    margin-top: 24px;
+    margin-bottom: 16px;
+    font-weight: 600;
+    line-height: 1.25;
+}
+
+.post-content h1 {
+    font-size: 2em;
+    padding-bottom: 0.3em;
+    border-bottom: 1px solid #d0d7de;
+}
+
+.post-content h2 {
+    font-size: 1.5em;
+    padding-bottom: 0.3em;
+    border-bottom: 1px solid #d0d7de;
+}
+
+.post-content h3 {
+    font-size: 1.25em;
+}
+
+.post-content h4 {
+    font-size: 1em;
+}
+
+.post-content h5 {
+    font-size: 0.875em;
+}
+
 
 /* GitHub-like light code block style */
 .post-content .highlight:not(table) {
