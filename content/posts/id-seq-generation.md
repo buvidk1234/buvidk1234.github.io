@@ -2,6 +2,7 @@
 date = '2026-03-05T15:34:07+08:00'
 draft = false
 title = 'Id Seq Generation'
+tags = ['IM']
 +++
 
 # 分布式 ID / 序列号生成方案技术选型

@@ -2,6 +2,7 @@
 date = '2025-12-23T21:47:09+08:00'
 draft = false
 title = 'Rockscache Consistency'
+tags = ['IM']
 +++
 
 # 深入解析 RocksCache：如何优雅地解决缓存与数据库一致性问题
