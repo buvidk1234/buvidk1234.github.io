@@ -12,19 +12,19 @@ title = 'Agent_practice'
 **诊断类问题**
 
 解释问题 VS 解决问题
-![ExplainvsSolve](/static/images/ExplainvsSolve.png)
+![ExplainvsSolve](/images/ExplainvsSolve.png)
 
 ### React Agent
 
 从Agent的最开始，LLM先思考（Thought），然后触发动作（Action）和输入（Action Input），之后执行并观察工具执行结果（Observation），如果观察的效果不满足需求，会重回到思考阶段，最后生成最终回答（Final Answer）
 
-![react_agent](/static/images/react_agent.png)
+![react_agent](/images/react_agent.png)
 
 
 选择API、反问、提取入参、执行API的准确度
 
 “问题识别” -> “查询SOP工具” -> “反问客户、获取信息” -> “根据信息查询工具” -> “查询到工具执行结果” -> “根据执行结果来回复客户” -> “客户继续沟通” -> ... -> “解决问题” 
-![planningexample](/static/images/planningexample.png)
+![planningexample](/images/planningexample.png)
 
 ```text
 用户提问 -> 判断意图 -> 模糊 -> 追问
@@ -79,7 +79,7 @@ KV cache, 模型参数裁剪，模型蒸馏, 量化技术
 
 将任务拆分为粗粒度子任务，依次执行每个子任务，执行子任务时进一步拆分细粒度任务，执行出错进行调整，执行过程中生成todo list
 
-![manus.png](/static/images/manus.png)
+![manus.png](/images/manus.png)
 
 ## 构建高可用agent
 
@@ -106,7 +106,7 @@ Agent一定要实现函数调用吗？如果只是通过Prompt完成一段指令
 
 Agentic RAG，大模型自主生成搜索的query，进行搜索
 
-![workflow](/static/images/workflow.png)
+![workflow](/images/workflow.png)
 
 - 领域信息集成
 如何将领域信息或者领域知识注入到大模型里面
@@ -204,7 +204,7 @@ Prompt中动态领域: 动态引入领域先验知识，通过类似RAG的方式
 
 ### 选型
 
-![agentselection](/static/images/agentselection.png)
+![agentselection](/images/agentselection.png)
 
 ## reference
 
@@ -221,3 +221,5 @@ Prompt中动态领域: 动态引入领域先验知识，通过类似RAG的方式
 - [Agent/Skills/Teams 架构演进过程及技术选型之道](https://mp.weixin.qq.com/s/Z8JYgxUdHSLo4ywgyt4ljg)
 
 - [Deploy Your Own AI Agent in 45 Minutes | Beginner OpenClaw Tutorial](https://www.youtube.com/watch?v=sO6NSSOWDO0)
+
+- [企业级 Agent 多智能体架构与选型指南 -- 来自1000+行业应用实践积累](https://mp.weixin.qq.com/s/_bz8DEgp4Lqt-xTa_lWN0A)
