@@ -754,6 +754,81 @@ type itab struct {
 goroutine, machine, processor
 一个machine绑定一个processor, processor调度goroutine，优先处理本地队列的协程。
 每个processor有一个本地队列，还有一个全局队列。
+
+```go
+// 栈内存区间 [lo, hi) 2kb
+type stack struct { // 协程的栈
+	lo uintptr
+	hi uintptr
+}
+// goroutine 切换时保存/恢复的寄存器上下文
+type gobuf struct {
+    sp   uintptr        // 栈指针
+    pc   uintptr        // 程序计数器（下次从哪里继续执行）
+    g    guintptr       // 所属的 g
+    ctxt unsafe.Pointer // 闭包上下文
+    bp   uintptr        // 帧指针（用于 traceback）
+}
+type g struct {
+    // ===== 栈管理 =====
+    stack       stack   // 栈内存区间 [lo, hi)，初始 2KB
+    stackguard0 uintptr // 栈溢出哨兵，设为 StackPreempt 时触发协作式抢占
+
+    // ===== panic/defer 链 =====
+    _panic *_panic // 最内层 panic，多个 panic 形成链表
+    _defer *_defer // 最内层 defer，LIFO 链表
+
+    // ===== 调度核心 =====
+    m            *m           // 当前绑定的 M（系统线程），未运行时为 nil
+    sched        gobuf        // 保存 SP/PC/BP 等寄存器，goroutine 切换的核心
+    atomicstatus atomic.Uint32 // 状态机：_Grunnable/_Grunning/_Gwaiting/_Gsyscall/_Gpreempted
+    goid         uint64       // goroutine 唯一 ID
+    schedlink    guintptr     // 运行队列链表中的下一个 g
+
+    // ===== 系统调用 =====
+    syscallsp uintptr // 进入 syscall 时保存的 SP，供 GC 扫描栈使用
+    syscallpc uintptr // 进入 syscall 时保存的 PC
+
+    // ===== 等待/阻塞 =====
+    waitsince  int64      // 阻塞开始的时间戳
+    waitreason waitReason // 阻塞原因：chanRecv / sleep / semaphore 等
+    waiting    *sudog     // 正在等待的 sudog 链表（channel/select 操作）
+
+    // ===== 抢占控制 =====
+    preempt     bool // 抢占信号，配合 stackguard0 = StackPreempt
+    preemptStop bool // true=抢占后进 _Gpreempted（GC STW 用）；false=仅让出 CPU
+
+    // ===== 创建溯源 =====
+    parentGoid uint64  // 父 goroutine 的 ID
+    gopc       uintptr // go 语句的 PC（traceback 显示 "created by ..."）
+    startpc    uintptr // goroutine 函数入口 PC
+
+    // ===== 线程绑定 =====
+    lockedm muintptr // LockOSThread() 锁定的 M
+
+    // ===== GC 辅助 =====
+    gcAssistBytes int64 // GC assist 信用，负值表示欠债需帮 GC 做标记扫描
+
+    // ===== 其他 =====
+    timer      *timer         // time.Sleep 缓存的 timer
+    selectDone atomic.Uint32  // select 竞争标志
+    param      unsafe.Pointer // 通用参数传递（channel唤醒/GC/debugCall/panic recover）
+    coroarg    *coro          // Go 1.23+ 协程转移参数（iter.Pull）
+
+	// 	实现协程需要解决什么？          对应哪些字段？
+	// ───────────────────────────────────────────
+	// ① 暂停/恢复执行上下文          sched, m, atomicstatus
+	// ② 轻量级栈管理                stack, stackguard0
+	// ③ 抢占（不能饿死其他协程）     preempt, preemptStop, stackguard0
+	// ④ 高效阻塞（不浪费线程）       waitreason, waiting, waitsince, syscallsp/pc, timer, selectDone
+	// ⑤ 创建/销毁/排队              startpc, gopc, parentGoid, goid, schedlink, lockedm
+	// ⑥ 与 GC 协作                  gcAssistBytes, param
+}
+
+```
+
+
+
 ## 内存管理
 mcache,mcentral, mheap
 微小对象，小对象，大对象
