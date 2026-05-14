@@ -278,13 +278,13 @@ HotKey.AddWithValue(key, result, 1)
 // 存入：用"与 startTime 的偏移量"代替绝对时间戳
 item.ttl = ttl + uint32(now - l.startTime)
 
-// 读取：比较偏移量，避免重复调用 time.Now()
+// 读取
 if int64(val.ttl) > (time.Now().UnixNano()/ms - l.startTime) {
     return val.val, true
 }
 ```
 
-用启动时间作为基准偏移，减少时间相关的运算开销。底层是 `groupcache/lru`，容量满后自动淘汰最久未使用的 key。
+这里把“过期时间点”编码成 **相对进程启动时间的偏移量（ms）**：存的是 `expireOffset = (now-startTime)+ttl`，读取时只需比较当前偏移量是否超过 `expireOffset`。相较直接存 Unix 绝对时间戳（通常是 `int64`），这种方式可以把字段压到 `uint32`，让每个缓存项更紧凑、比较也更简单；代价是 `uint32` 毫秒大约在 49.7 天会回绕，并且使用墙上时钟（`time.Now()`）在系统时间被校时跳变时可能出现偏差，因此更适合“TTL 不会太长、进程也会定期重启/发布”的热点本地缓存场景。底层是 `groupcache/lru`，容量满后自动淘汰最久未使用的 key。
 
 ---
 
