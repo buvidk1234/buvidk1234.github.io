@@ -7,6 +7,15 @@ theme = 'PaperMod'
     mermaid = true
     math = true
 
+    [params.homeInfoParams]
+        Title = '我的技术博客'
+        Content = '欢迎交流。'
+
+    [[params.socialIcons]]
+        name = 'github'
+        title = 'GitHub'
+        url = 'https://github.com/buvidk1234'
+
 [outputs]
     home = ['HTML', 'RSS', 'JSON']
 
