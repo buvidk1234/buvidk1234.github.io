@@ -2,6 +2,7 @@
 date = '2026-01-15T02:27:08+08:00'
 draft = false
 title = 'Mysql Technical Blog'
+tags = ['MySQL']
 +++
 
 # MySQL 技术要点

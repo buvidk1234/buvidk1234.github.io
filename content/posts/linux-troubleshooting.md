@@ -2,6 +2,7 @@
 date = '2026-02-28T16:43:35+08:00'
 draft = false
 title = 'Linux Troubleshooting'
+tags = ['Linux']
 +++
 
 ## L1 日常排错篇

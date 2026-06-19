@@ -2,6 +2,7 @@
 date = '2026-04-02T23:27:01+08:00'
 draft = false
 title = '微服务稳定性兜底：深入解析 go-kratos/aegis 的核心设计'
+tags = ['IM']
 +++
 
 # 微服务稳定性兜底：深入解析 go-kratos/aegis 的核心设计

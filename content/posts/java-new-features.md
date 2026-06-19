@@ -2,6 +2,7 @@
 date = '2026-02-04T20:35:56+08:00'
 draft = false
 title = 'Java New Features'
+tags = ['Java']
 +++
 
 ## 前言

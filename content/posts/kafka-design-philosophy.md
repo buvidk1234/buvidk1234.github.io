@@ -2,6 +2,7 @@
 date = '2025-12-24T00:59:41+08:00'
 draft = false
 title = 'Kafka Design Philosophy'
+tags = ['Kafka']
 +++
 
 # 深入理解 Apache Kafka 设计哲学

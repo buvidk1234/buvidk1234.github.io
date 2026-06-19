@@ -2,7 +2,7 @@
 date = '2026-02-12T09:52:26+08:00'
 draft = false
 title = 'Redis Datastructure'
-tags = ['Redis', '数据结构', '源码分析']
+tags = ['Redis']
 categories = ['数据库']
 +++
 

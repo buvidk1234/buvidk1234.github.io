@@ -2,7 +2,7 @@
 date = '2025-12-28T22:27:08+08:00'
 draft = false
 title = 'Mysql Slow Query Filesort Optimization'
-tags = ['IM']
+tags = ['IM','MySQL']
 +++
 
 # IM 消息拉取接口的 SQL 优化记录

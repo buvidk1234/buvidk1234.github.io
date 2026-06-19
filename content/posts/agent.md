@@ -2,7 +2,7 @@
 date = '2026-03-09T21:18:26+08:00'
 draft = false
 title = 'Agent'
-tags = ['AI', 'Agent', 'LLM']
+tags = ['Agent']
 categories = ['人工智能']
 summary = '系统梳理 LLM Agent 的经典架构（Planning、Memory、Tools）及演进方向（Multi-Agent、MCP、A2A、Skills）。'
 +++

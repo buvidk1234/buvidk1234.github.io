@@ -2,7 +2,7 @@
 date = '2026-01-05T19:03:02+08:00'
 draft = false
 title = 'DDD Strategic and Tactical Design'
-tags = ['DDD', '领域驱动设计', '架构设计']
+tags = ['DDD']
 categories = ['软件架构']
 +++
 

@@ -2,7 +2,7 @@
 date = '2026-03-11T03:41:01+08:00'
 draft = false
 title = '用基础数学理解 nanoGPT 的语言建模'
-tags = ["LLM", "Transformer"]
+tags = ["LLM"]
 +++
 
 > 把语言建模问题写成条件概率：估计 $P(x_{t+1}\mid x_{\le t})$。

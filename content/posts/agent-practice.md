@@ -2,6 +2,7 @@
 date = '2026-03-17T12:42:23+08:00'
 draft = false
 title = 'Agent_practice'
+tags = ['Agent']
 +++
 
 ## 1. 客服agent

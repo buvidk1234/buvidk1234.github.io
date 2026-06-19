@@ -2,6 +2,7 @@
 date = '2025-12-23T00:44:39+08:00'
 draft = false
 title = 'K8s Troubleshooting'
+tags = ['Kubernetes']
 +++
 
 ## 前言
