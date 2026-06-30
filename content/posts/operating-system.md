@@ -4,9 +4,49 @@ draft = false
 title = 'Operating System'
 +++
 
+## 编译过程
+
+![compile system](/images/compile_system.png)
+
+## 计算机硬件结构
+
+![hardware structure](/images/hardware_structure.png)
+
 ## 虚拟内存
 
 ![virtual memory](/images/virtual_memory.png)
+
+![virtual memory linux](/images/virtual_memory_linux.png)
+
+![virtual memory page fault](/images/virtual_memory_page_fault.png)
+
+![virtual memory page copy on write](/images/virtual_memory_copy_on_write.png)
+
+## 地址翻译
+
+![corei7 1](/images/corei7_1.png)
+
+![corei7 2](/images/corei7_2.png)
+
+![corei7 3](/images/corei7_3.png)
+
+![corei7 4](/images/corei7_4.png)
+
+![corei7 5](/images/corei7_5.png)
+
+## 文件
+
+![file](/images/file.png)
+
+## 网络
+
+![network](/images/network.png)
+
+![socket](/images/socket.png)
+
+## 并发
+
+![deadlock](/images/deadlock.png)
 
 ## 进程
 
