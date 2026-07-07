@@ -1667,12 +1667,2075 @@ syscall 返回后，如果拿不到 P，当前 G 会被改回 _Grunnable 并放�
 
 ## Part 3 Memory & GC
 
+调度器解决的是“谁来运行”的问题，Memory & GC 解决的是“运行时数据放在哪里、什么时候回收”的问题。它们不是两个孤立模块：`P` 持有 `mcache`，goroutine 栈是 GC 根，分配路径会触发 GC assist，GC 又需要调度器停止世界、启动后台标记 worker、抢占 goroutine 扫描栈。
+
+先不要急着记源码名。Memory 这一部分最容易被一串术语劝退，先把后文会反复出现的词铺开。下面这张表不是背诵表，而是阅读索引：第一次看到某个词时，先回来确认它在整张图里的位置。
+
+#### 基础对象和分配词
+
+```text
+object / 对象
+  程序真正想要的那块数据，例如一个 Node、一个 map 桶、一个 slice 底层数组。
+
+pointer / 指针
+  指向另一个对象地址的值。GC 最关心的是对象里哪些字段是指针。
+
+allocation / 分配
+  给对象找一块可用内存。可能发生在栈上，也可能发生在堆上。
+
+stack allocation / 栈分配
+  对象跟随函数调用栈生命周期，函数返回后自然失效，通常不需要 GC 单独回收。
+
+heap allocation / 堆分配
+  对象生命周期可能超过当前函数，放到 Go 堆上，由 GC 判断什么时候回收。
+
+escape analysis / 逃逸分析
+  编译器判断对象能否放在栈上的过程。逃逸到函数外、被闭包长期持有、太大或情况复杂时，可能进入堆。
+
+runtime metadata / 运行时元数据
+  runtime 用来理解内存的账本，例如类型信息、栈图、堆位图、span 信息。
+```
+
+#### 栈相关词
+
+```text
+goroutine stack / goroutine 栈
+  每个 goroutine 自己的调用栈。初始较小，不够时按需增长，也可能在 GC 时机收缩。
+
+stack frame / 栈帧
+  一次函数调用在栈上占用的一段空间，保存参数、局部变量、返回地址等。
+
+SP / stack pointer
+  当前栈指针。Go 栈通常向低地址增长，函数调用会让 SP 向 stack.lo 靠近。
+
+PC / program counter
+  当前或将要执行的指令位置。调度和栈扫描都需要知道 PC。
+
+stack.lo / stack.hi
+  一个 goroutine 当前栈内存的低地址和高地址边界。
+
+stackguard
+  栈检查哨兵。函数入口会比较 SP 和 stackguard，发现空间不够就走 morestack。
+
+morestack
+  编译器在函数入口栈检查失败时跳到的汇编入口，负责切到 runtime 扩栈流程。
+
+newstack
+  runtime 执行栈增长的核心逻辑，决定分配更大的栈并迁移旧内容。
+
+copystack
+  把旧栈内容复制到新栈，同时修正栈里指向旧栈地址的指针。
+
+shrinkstack
+  在合适时机把过大的 goroutine 栈缩小，避免峰值调用深度长期占内存。
+
+g0 stack / system stack
+  每个 M 的 runtime 专用栈。调度、扩栈、GC 等底层逻辑常切到 g0 上执行。
+
+stack map / 栈图
+  编译器生成的元数据，告诉 GC 某个安全点上栈帧哪些位置是指针。
+
+safe point / 安全点
+  runtime 能正确理解当前栈、寄存器和对象指针的位置。栈增长、抢占、GC 栈扫描都依赖安全点。
+
+root / 根
+  GC 标记的起点。goroutine 栈、全局变量、寄存器、runtime 堆外引用都可能是根。
+
+g.sched
+  某个 goroutine 被挂起时保存的 PC/SP 现场，可以理解成下次恢复执行的书签。
+```
+
+#### 分配器相关词
+
+```text
+mallocgc
+  Go 堆分配的核心入口。很多 new、make、逃逸对象最终会落到这里。
+
+newobject
+  分配一个具体类型对象的 runtime 入口，内部通常会调用 mallocgc。
+
+tiny allocator
+  给极小且不含指针的对象用的合并分配优化，减少小碎片和分配次数。
+
+small object / 小对象
+  不超过 runtime 小对象上限的分配，会按 size class 从 span 槽位里拿。
+
+large object / 大对象
+  超过小对象上限的分配，通常直接从 mheap 拿一个或多个专用 span。
+
+size class
+  小对象的规格表。不是 Go 类型，而是 runtime 预设的内存格子大小。
+  例如 17B 的对象不能随便切 17B，可能被放进 24B 或 32B 的格子。
+
+spanClass
+  size class 再加上 scan/noscan 信息。相同大小但是否含指针不同，会进入不同 spanClass。
+
+scan object
+  对象里可能含堆指针，GC 标记时要扫描对象内容。
+
+noscan object
+  对象里不含堆指针，例如纯字节数据。GC 可以跳过对象内容，降低扫描成本。
+
+mcache
+  每个 P 本地的小对象分配缓存。常见小对象分配先从这里拿，快路径通常不用全局锁。
+
+mcentral
+  某个 spanClass 的中心仓库。mcache 没有可用 span 时，向对应 mcentral 补货。
+
+mheap
+  runtime 的全局堆管理器。它不是单个数组，而是管理 arena、page、span、central、页分配器等结构的总管。
+
+object slot / 对象槽位
+  小对象 span 被切成很多同规格格子，每个格子就是一个可放对象的槽位。
+
+freeindex
+  mspan 中下次查找空闲槽位的大致起点，用来加快分配。
+
+allocCache
+  mspan 中缓存的一小段空闲位信息，用位运算快速找空槽位。
+```
+
+#### 堆结构和位图词
+
+```text
+page
+  runtime 管理堆时使用的页粒度。span 由连续 page 组成。
+
+span / mspan
+  一段连续 heap page。小对象 span 会被切成很多同样大小的槽位。
+  mspan 是这段内存的管理账本，记录格子大小、哪些格子已分配、哪些对象被 GC 标记。
+
+arena
+  堆地址空间中的一大片区域。可以把它理解成一片仓库园区。
+
+heapArena
+  arena 的地图和档案。runtime 用它从一个地址快速查到：它属于哪个 span、哪里有位图。
+
+heap bitmap / 堆位图
+  标记和扫描用的位图信息，帮助 runtime 判断对象中哪些位置是指针、哪些对象被标记。
+
+allocBits
+  mspan 的分配位图。表示每个对象槽位当前是否已经分配出去。
+
+gcmarkBits
+  mspan 的标记位图。表示当前 GC 周期里哪些已分配对象被标记为存活。
+
+sweepgen
+  span 的清扫代际编号。runtime 用它判断某个 span 是否已经完成本轮 sweep。
+
+pageInUse
+  heapArena 里记录页是否正在使用的元数据。
+
+pageMarks
+  heapArena 里记录哪些页上有标记对象的元数据，辅助 GC 和清扫。
+
+scavenger
+  后台归还物理内存的机制。它处理的是 runtime 空闲页和 OS 物理内存之间的关系，不等同于 GC 标记对象。
+```
+
+#### GC相关词
+
+```text
+GC cycle / GC 周期
+  从准备标记、并发标记、标记终止到清扫的一轮回收过程。
+
+mutator
+  用户程序本身。GC 论文和 runtime 里经常把正在分配对象、修改对象指针关系的用户代码叫 mutator。
+
+STW / stop the world
+  暂停所有用户 goroutine，让 runtime 做阶段切换或一致性处理。Go GC 仍有 STW，但通常较短。
+
+mark / 标记
+  从 roots 出发，沿指针找到所有仍可达对象，并设置 gcmarkBits。
+
+sweep / 清扫
+  GC 标记完以后，把“已分配但没被标记”的对象槽位重新变成可分配。
+
+white / grey / black
+  三色标记模型。白色是未发现，灰色是已发现但还没扫描完，黑色是已扫描完成。
+
+work queue / GC 工作队列
+  保存待扫描 root job 和灰色对象的队列。mark worker 和 assist 都会从这里取活干。
+
+gcDrain
+  消耗 GC 工作队列的核心逻辑：取灰色对象，扫描指针字段，发现新对象再入队。
+
+write barrier / 写屏障
+  并发标记期间插入到指针写入附近的逻辑，防止用户代码改指针时 GC 漏标对象。
+
+shade
+  写屏障里的概念动作：把某个对象标记成灰色或确保它进入标记流程。
+
+mark worker
+  后台执行 GC 标记工作的 goroutine。常见有 dedicated、fractional、idle 几类。
+
+mutator assist
+  用户 goroutine 分配太快时，runtime 让它先帮 GC 扫一会儿对象，再继续分配。
+
+assist debt / assist credit
+  分配 goroutine 在 GC 标记期间欠下或拥有的“扫描工作账”。欠太多就要进入 assist。
+
+pacer
+  GC 节奏控制器。它决定什么时候开始下一轮 GC，以及后台 worker 和分配者要做多少标记工作。
+
+GOGC
+  以存活堆为基准控制下一轮 heap goal 的比例参数。默认 100，大致表示目标堆约为存活堆两倍。
+
+GOMEMLIMIT
+  Go runtime 的软内存限制。它会影响 pacer，使 GC 更积极，但不是 OS 级硬限制。
+
+heapLive
+  当前 runtime 认为仍然活着或已分配的堆大小估计。
+
+heapMarked
+  上一轮 GC 标记完成后确认存活的堆大小。
+
+heapGoal
+  当前 GC 周期希望控制住的目标堆大小。
+
+trigger
+  开始下一轮 GC 的触发点。它通常小于 heapGoal，因为并发标记需要时间。
+
+assistWorkPerByte
+  pacer 计算出的比例：每分配一定字节，mutator 大概要帮 GC 做多少扫描工作。
+```
+
+#### 调度协作和观测词
+
+```text
+G / M / P
+  G 是 goroutine，M 是 OS 线程，P 是执行 Go 代码所需的处理器资源。
+  内存分配里 P 很重要，因为 P 持有 mcache。
+
+runtime.sched
+  全局调度器状态，保存全局运行队列、空闲 M/P 等信息。不要和 g.sched 混淆。
+
+sysmon
+  runtime 系统监控线程。它会参与抢占、syscall retake、timer/netpoll、GC 辅助推进等后台维护。
+
+HeapAlloc
+  当前仍被 Go 堆对象占用的字节数，接近“业务对象还占着多少堆”。
+
+HeapSys
+  runtime 从 OS 获得的堆相关虚拟内存总量，不等于当前活对象大小。
+
+HeapIdle
+  runtime 堆里空闲但还没完全归还 OS 的内存。
+
+HeapReleased
+  runtime 已经归还或建议归还给 OS 的堆内存。
+
+NextGC
+  runtime 估计的下一轮 GC 目标附近的堆大小。
+
+NumGC
+  已完成的 GC 周期数。
+```
+
+脑子里可以先有这张粗图：
+
+```text
+用户代码创建对象
+  |
+  v
+逃逸到堆上
+  |
+  v
+按大小选择 size class
+  |
+  v
+从当前 P 的 mcache 找一个 mspan
+  |
+  v
+mspan 里拿一个空格子放对象
+  |
+  v
+GC 标记时通过 heapArena 和 mspan 元数据识别对象
+  |
+  v
+sweep 时把死亡对象的格子重新标为空闲
+```
+
+这一部分可以先建立一张地图：
+
+```text
+goroutine
+  |
+  +-- stack
+  |     stackguard / morestack / copystack / shrinkstack
+  |
+  +-- heap allocation
+        |
+        v
+      mallocgc
+        |
+        +-- tiny allocator
+        +-- small object: mcache -> mcentral -> mheap
+        +-- large object: mheap
+        |
+        v
+      span / heapArena metadata
+        |
+        v
+      GC mark & sweep
+        |
+        +-- root scan: stacks, globals, runtime data
+        +-- write barrier
+        +-- background mark worker
+        +-- mutator assist
+        +-- concurrent sweep
+        +-- pacer
+```
+
+理解这部分时要避免两个误区：
+
+- 栈不是固定大小的一块内存。goroutine 栈可以增长，也可以在合适时机缩小，增长时会复制到新位置。
+- GC 不是“等内存满了再停下来全量清理”。现代 Go GC 的主要工作和用户 goroutine 并发执行，只在阶段切换时短暂 STW。
+
 ### 10 Goroutine栈管理
+
+goroutine 之所以能大量创建，一个重要原因是它不直接使用 OS 线程那种较大的固定栈。每个 goroutine 有自己的用户态栈，初始大小很小，随着调用深度和局部变量需求按需增长。
+
+源码入口主要在：
+
+```text
+runtime/runtime2.go   g.stack、g.stackguard0、g.sched
+runtime/stack.go      stackalloc、newstack、copystack、shrinkstack
+runtime/asm_*.s       morestack、gogo 等汇编入口
+runtime/proc.go       newproc1 创建 goroutine 时分配栈
+```
+
+`g` 里和栈、恢复现场直接相关的字段可以抽象为：
+
+```text
+g
+  stack.lo       当前栈内存低地址
+  stack.hi       当前栈内存高地址
+  stackguard0    普通 Go 代码的栈检查边界，也可被设置为抢占哨兵值
+  stackguard1    系统栈相关检查
+
+  sched.sp       goroutine 暂停时保存的栈指针
+  sched.pc       goroutine 暂停时保存的程序计数器
+  sched.g        指回当前 goroutine
+```
+
+`stack.lo`、`stack.hi` 和 `stackguard` 描述的是“这段栈在哪里、还能不能继续用”；`g.sched` 描述的是“这个 goroutine 被挂起后，下次从哪里恢复”。调度器把 `G` 从一个 `M` 切走时，会把现场保存到 `g.sched`；以后再运行这个 `G`，`gogo` 之类的汇编入口会根据这份现场恢复执行。
+
+注意 `g.sched` 和 `runtime.sched` 不是一回事。前者是单个 goroutine 的恢复书签；后者是全局调度器状态，保存空闲 `M`、空闲 `P`、全局运行队列等信息。
+
+Go 栈通常向低地址增长，所以 `stack.hi` 是栈顶方向，`stack.lo` 是栈底方向。函数调用会消耗更多栈空间，使 SP 向 `stack.lo` 靠近。
+
+#### 函数入口的栈检查
+
+编译器会在很多函数入口插入栈检查。不同架构生成的指令不同，但逻辑可以简化为：
+
+```text
+进入函数
+  |
+  v
+计算当前函数需要的栈空间
+  |
+  v
+检查 SP 是否越过 g.stackguard0
+  |
+  +-- 没越过：继续执行函数体
+  |
+  +-- 越过：调用 runtime.morestack
+              |
+              v
+            保存当前调用现场
+              |
+              v
+            切到当前 M 的 g0 栈
+              |
+              v
+            runtime.newstack
+              |
+              +-- 如果这是抢占请求：走抢占路径
+              |
+              +-- 如果确实空间不足：分配更大栈并复制
+```
+
+`morestack` 是汇编入口。它不直接在当前 goroutine 栈上执行复杂逻辑，而是保存现场后切到 `g0` 栈，再进入 `newstack`。这样做的原因是：当前 goroutine 的栈已经可能不够用了，继续在这块栈上跑 runtime 代码本身也可能溢出。
+
+这里有一个关键点：`stackguard0` 不只表示“栈空间不够”。runtime 也会把它设置成特殊值，例如 `stackPreempt`，让下一次函数入口检查失败，从而把 goroutine 引到 `morestack/newstack` 这条路径上处理同步抢占。所以看到 `morestack`，不一定意味着栈真的满了，也可能是调度器想让当前 goroutine 到达安全点。
+
+#### 连续栈：扩容和缩小都靠copystack
+
+Go 早期使用过分段栈，后来改为连续栈。今天的主流模型是：每个 goroutine 持有一段连续栈空间；不够用时复制到更大的栈，太空时也可以复制到更小的栈。扩容和缩小的方向不同，但真正搬栈的核心都是 `copystack`。
+
+先看 `newstack` 的关键代码。下面摘自 `runtime/stack.go`，删掉了 debug 打印和部分错误处理：
+
+```go
+func newstack() {
+	oldsize := gp.stack.hi - gp.stack.lo
+	newsize := oldsize * 2
+
+	if f := findfunc(gp.sched.pc); f.valid() {
+		max := uintptr(funcMaxSPDelta(f))
+		needed := max + stackGuard
+		used := gp.stack.hi - gp.sched.sp
+		for newsize-used < needed {
+			newsize *= 2
+		}
+	}
+
+	casgstatus(gp, _Grunning, _Gcopystack)
+	copystack(gp, newsize)
+	casgstatus(gp, _Gcopystack, _Grunning)
+	gogo(&gp.sched)
+}
+```
+
+这段代码说明几件事：
+
+- 扩容默认从 `oldsize * 2` 开始。
+- 如果当前函数帧需要更多空间，就继续翻倍。
+- 搬栈前把 goroutine 状态切到 `_Gcopystack`，避免并发 GC 同时扫描这段正在移动的栈。
+- 真正复制和修正指针的是 `copystack`。
+- 完成后通过 `gogo(&gp.sched)` 回到 goroutine 的执行现场。
+
+为什么复制栈是可行的？关键是编译器会为安全点生成栈图。栈图可以粗略理解成“这个函数帧里哪些槽位是指针”的位图：
+
+```text
+frame f, safe point pc=...
+
+slot        内容示例          栈图
+SP+0        返回地址          -
+SP+8        x int             scalar
+SP+16       p *int            pointer
+SP+24       n *Node           pointer
+SP+32       count int         scalar
+```
+
+实际 runtime 里的栈图不是这样的人类表格，而是压缩后的位图和 PC 元数据；但读代码时可以把它想成这张表。
+
+栈搬家时，`copystack` 先复制字节，再根据栈图修正“指向旧栈内部”的指针：
+
+```text
+例子：p := &x
+
+复制前 old stack        只复制后 new stack        修正后 new stack
+0x1000 x = 10           0x3000 x = 10             0x3000 x = 10
+0x1008 p = 0x1000  -->  0x3008 p = 0x1000   -->   0x3008 p = 0x3000
+        指向旧 x                 错：还指向旧栈           对：指向新 x
+```
+
+这就是“栈可以搬家”的关键：runtime 不猜哪些字节像地址，而是靠栈图知道哪些槽位是指针，再只修正落在旧栈范围内的指针。
+
+`copystack` 的关键代码更直接。下面同样是关键摘录，删掉了调试和非主线分支：
+
+```go
+func copystack(gp *g, newsize uintptr) {
+	if gp.syscallsp != 0 {
+		throw("stack growth not allowed in system call")
+	}
+	old := gp.stack
+	used := old.hi - gp.sched.sp
+	new := stackalloc(uint32(newsize))
+
+	var adjinfo adjustinfo
+	adjinfo.old = old
+	adjinfo.delta = new.hi - old.hi
+
+	ncopy := used
+	if !gp.activeStackChans {
+		adjustsudogs(gp, &adjinfo)
+	} else {
+		adjinfo.sghi = findsghi(gp, old)
+		ncopy -= syncadjustsudogs(gp, used, &adjinfo)
+	}
+
+	memmove(unsafe.Pointer(new.hi-ncopy), unsafe.Pointer(old.hi-ncopy), ncopy)
+
+	adjustctxt(gp, &adjinfo)
+	adjustdefers(gp, &adjinfo)
+	adjustpanics(gp, &adjinfo)
+
+	gp.stack = new
+	gp.stackguard0 = new.lo + stackGuard
+	gp.sched.sp = new.hi - used
+
+	for u.init(gp, 0); u.valid(); u.next() {
+		adjustframe(&u.frame, &adjinfo)
+	}
+	stackfree(old)
+}
+```
+
+这段代码比文字流程图更能说明问题：
+
+- `used := old.hi - gp.sched.sp` 算出旧栈真正用到的部分。
+- `adjinfo.delta = new.hi - old.hi` 是新旧栈地址差，后面所有指针修正都靠它。
+- `adjustsudogs` / `syncadjustsudogs` 处理 channel 等待记录里的栈指针。
+- `adjustdefers`、`adjustpanics` 处理 defer/panic 链里的栈指针。
+- `adjustframe` 根据栈图遍历每个栈帧，修正栈帧里的指针。
+- `gp.stack`、`gp.stackguard0`、`gp.sched.sp` 最后切到新栈。
+
+所以 channel、defer、panic 的问题不是“缩栈专属问题”，而是所有栈搬迁都必须面对的问题。扩容和缩小都应该从 `copystack` 这里统一理解。
+
+#### 栈分配与栈缓存
+
+goroutine 栈不是用普通堆对象的形式直接交给用户代码管理。`stackalloc` 会在系统栈上运行，并根据栈大小选择不同来源：
+
+```text
+小栈
+  |
+  +-- 优先从当前 P 的 mcache.stackcache 获取
+  +-- 不足时从全局 stackpool 补充
+
+大栈
+  |
+  +-- 从 stackLarge 缓存获取
+  +-- 不足时向 mheap 申请 manual span
+```
+
+这里又能看到调度器和内存管理的关系：`P` 不只持有运行队列，也持有分配相关缓存，包括普通小对象的 `mcache` 和小栈缓存。这样可以避免每次创建 goroutine 都争用全局堆锁。
+
+#### 栈缩小
+
+栈能增长，也能缩小。一个 goroutine 曾经递归很深或调用过大栈帧函数，不代表它之后永远占着那块大栈。GC 扫描栈时可以发现栈使用量，runtime 会在安全时机尝试缩小栈。
+
+缩栈比扩栈多一层安全检查。`isShrinkStackSafe` 的关键代码是：
+
+```go
+func isShrinkStackSafe(gp *g) bool {
+	if gp.syscallsp != 0 {
+		return false
+	}
+	if gp.asyncSafePoint {
+		return false
+	}
+	if gp.parkingOnChan.Load() {
+		return false
+	}
+	if readgstatus(gp)&^_Gscan == _Gwaiting &&
+		gp.waitreason.isWaitingForSuspendG() {
+		return false
+	}
+	return true
+}
+```
+
+这里的重点不是“channel 一定不能缩栈”，而是缩栈必须在 runtime 能精确掌握指针和同步状态时发生。`syscall`、异步安全点、正在 channel parking 的窗口，也就是 goroutine 正在把自己挂入 channel 等待队列的窗口，都可能让指针信息或同步状态不够可靠。
+
+真正决定缩不缩的是 `shrinkstack`：
+
+```go
+func shrinkstack(gp *g) {
+	if !isShrinkStackSafe(gp) {
+		throw("shrinkstack at bad time")
+	}
+	if debug.gcshrinkstackoff > 0 {
+		return
+	}
+
+	oldsize := gp.stack.hi - gp.stack.lo
+	newsize := oldsize / 2
+	if newsize < fixedStack {
+		return
+	}
+
+	avail := gp.stack.hi - gp.stack.lo
+	if used := gp.stack.hi - gp.sched.sp + stackNosplit; used >= avail/4 {
+		return
+	}
+
+	copystack(gp, newsize)
+}
+```
+
+这段代码和 `newstack` 对照看就很清楚：
+
+```text
+扩栈 newstack:
+  oldsize * 2
+  当前帧放不下就继续翻倍
+  copystack(gp, bigger)
+
+缩栈 shrinkstack:
+  oldsize / 2
+  小于 fixedStack 不缩
+  已使用 >= 1/4 不缩
+  copystack(gp, smaller)
+```
+
+所以缩栈和扩栈不是两套搬迁逻辑。它们只是计算 `newsize` 的策略不同，最后都回到 `copystack`。
+
+#### 栈与GC根扫描
+
+GC 判断堆对象是否存活时，需要从根对象出发。goroutine 栈就是最重要的根之一。栈上局部变量如果保存了堆指针，那么这个堆对象必须被认为可达。
+
+栈扫描大致需要：
+
+```text
+找到一个 goroutine
+  |
+  v
+让它处在可扫描的稳定状态
+  |
+  v
+沿调用栈遍历栈帧
+  |
+  v
+根据函数栈图找出指针槽位
+  |
+  v
+把槽位里的堆指针标记为灰色对象
+```
+
+栈越大、栈上的指针越多，GC 根扫描成本越高。所以 goroutine 虽然轻量，但不是没有成本。大量 goroutine 如果都持有很深的栈或很多指针，仍然会增加 GC 工作量。
+
+#### g0、gsignal和用户栈
+
+不是所有 goroutine 栈都一样。每个 `M` 通常有：
+
+```text
+g0       当前 OS 线程的调度栈，执行 runtime 调度、栈增长、系统级逻辑
+gsignal  信号处理相关栈
+普通 G   用户 goroutine 栈
+```
+
+普通 Go 函数运行在用户 goroutine 栈上；调度器、栈分配、栈复制等关键 runtime 路径通常要切到 `g0` 栈上执行。`g0` 不像普通 goroutine 那样参与用户代码调度，也不能随便执行可能增长栈的逻辑。
+
+可以把三者区别记成：
+
+| 栈 | 主要用途 | 是否运行普通用户代码 |
+| --- | --- | --- |
+| 普通 G 栈 | 执行业务函数、保存调用帧 | 是 |
+| g0 栈 | 调度、栈管理、mcall/systemstack 逻辑 | 否 |
+| gsignal 栈 | 信号处理 | 否 |
+
+#### 栈管理小结
+
+goroutine 栈管理的核心不是“初始栈很小”这一句话，而是一整套动态机制：
+
+```text
+编译器插入栈检查
+  -> runtime.morestack 进入栈增长或抢占路径
+  -> stackalloc 分配新栈
+  -> copystack 复制并修正指针
+  -> GC 扫描栈作为根
+  -> 合适时机 shrinkstack 缩小栈
+```
+
+这套机制让 goroutine 创建成本低于 OS 线程，但代价是编译器、调度器、GC 和栈复制逻辑必须紧密协作。
+
 ### 11 内存分配器
+
+Go 代码里写下的分配并不一定都会进入堆分配器。编译器会先做逃逸分析：
+
+```go
+func f() *int {
+	x := 1
+	return &x
+}
+```
+
+这里 `x` 的地址逃出了函数，通常需要分配到堆上。相反，如果对象只在当前函数内部使用，编译器可能把它放在栈上，甚至完全优化掉。
+
+先看一个具体对象怎么进入堆。假设有一个 24 字节左右的 `Node`：
+
+```go
+type Node struct {
+	next *Node
+	val  int
+}
+
+func makeNode(v int) *Node {
+	return &Node{val: v}
+}
+```
+
+如果 `&Node{}` 逃逸到堆上，runtime 大概会经历这条路径：
+
+```text
+1. 需要分配一个 Node
+   |
+   v
+2. 计算对象大小，大约 24B
+   |
+   v
+3. 查 size class 表，选择能装下 24B 的规格
+   |
+   v
+4. 因为 Node 里有 next *Node，所以选择 scan 类型的 spanClass
+   |
+   v
+5. 找当前 P 的 mcache.alloc[spanClass]
+   |
+   v
+6. 找到一个 mspan，它里面都是同规格格子
+   |
+   v
+7. 从 mspan 的空闲格子取一个，设置 allocBits
+   |
+   v
+8. 返回对象地址给用户代码
+```
+
+这几个词在这个例子里分别是什么：
+
+```text
+size class
+  “24B 或更大一点的格子规格”
+
+spanClass
+  “格子规格 + 这个格子里的对象要不要被 GC 扫描”
+
+mspan
+  “一整排同规格格子，以及这排格子的账本”
+
+mcache
+  “当前 P 手边的一小批可用格子，分配时先从这里拿”
+
+mcentral
+  “某种规格格子的中转仓库，mcache 没货时来这里补”
+
+mheap
+  “总仓库，mcentral 也没货时从这里切新的 span”
+```
+
+所以 `span` 不是某个对象，也不是 Go 类型。它更像一排货架：这排货架的每个格子大小一样，里面可以放同一规格的小对象。`size class` 则是货架格子的规格表。
+
+一旦对象确实需要进入堆，分配动作就会落到 runtime。常见入口包括：
+
+```text
+runtime.newobject       new(T)、&T{} 等对象分配
+runtime.makeslice       slice 底层数组分配
+runtime.makemap         map 初始化
+runtime.makechan        channel 初始化
+runtime.mallocgc        堆分配核心入口
+```
+
+分配器要同时满足几个目标：
+
+- 常见小对象分配要快，最好不加全局锁。
+- 内存碎片要可控。
+- 分配元数据要能支持 GC 精确扫描。
+- 向操作系统申请内存要批量化，不能每个对象都系统调用。
+- GC 并发标记期间，新分配对象要维持标记不变量。
+
+#### 分配器层级
+
+Go 分配器借鉴了 tcmalloc 的分层思想，但 runtime 源码已经演化出自己的实现。整体层级可以画成：
+
+```text
+mallocgc
+  |
+  +-- tiny allocator      极小且不含指针的对象
+  |
+  +-- small object        小对象，按 size class 分配
+  |     |
+  |     v
+  |   P.mcache            每个 P 的本地 span 缓存，无锁快路径
+  |     |
+  |     v
+  |   mcentral            每个 spanClass 的中心 span 集合
+  |     |
+  |     v
+  |   mheap               全局页级堆
+  |
+  +-- large object        大对象，直接向 mheap 申请 span
+        |
+        v
+      OS memory           必要时向操作系统申请更多页
+```
+
+源码注释里把小对象定义为不超过 32KB 的分配。小对象会被向上取整到某个 size class。每个 size class 对应固定大小的槽位，同一个 span 里的对象大小相同。
+
+例如要分配一个 24 字节对象，runtime 可能把它放进 24 或 32 字节的 size class 中，然后从当前 `P.mcache` 对应 span 里找一个空槽位。
+
+#### mcache：每个P的快速缓存
+
+`mcache` 是每个 `P` 持有的小对象分配缓存。它的关键特点是：当前 `M` 绑定着 `P` 执行 Go 代码时，可以直接访问这个 `P` 的 `mcache`，常见路径不需要全局锁。
+
+可以简化为：
+
+```text
+mcache
+  alloc[spanClass]    每个 spanClass 当前可分配的 mspan
+  tiny                tiny allocator 当前块
+  tinyoffset          tiny 块内偏移
+  stackcache          小栈缓存
+  scanAlloc           本 P 累计的可扫描分配量
+  flushGen            与 sweepgen 协作，判断缓存 span 是否过期
+```
+
+`spanClass` 不是单纯的 size class，它还包含“对象是否需要扫描”的信息。相同大小的对象，如果一种包含指针、一种不包含指针，runtime 会把它们放进不同的 span class。这样 GC 扫描时可以跳过整块不含指针的 span。
+
+```text
+spanClass = sizeClass + scan/noscan
+```
+
+可以把 `spanClass` 想成二维坐标，而不是一个单独数字：
+
+```text
+                 是否需要 GC 扫描
+              +-----------+-------------+
+              | scan      | noscan      |
++-------------+-----------+-------------+
+| 16B class   | 16B/scan  | 16B/noscan  |
+| 24B class   | 24B/scan  | 24B/noscan  |
+| 32B class   | 32B/scan  | 32B/noscan  |
++-------------+-----------+-------------+
+     大小规格
+```
+
+例如同样是 24B 左右：
+
+```text
+struct { next *Node; val int }   -> 24B/scan
+[3]uint64                        -> 24B/noscan
+```
+
+这个设计很重要。`[]byte`、字符串底层字节、纯数字结构体这类不含指针的数据，如果被放进 noscan span，GC 就不需要逐字扫描它们。
+
+#### mcentral：按spanClass管理span
+
+当 `mcache` 里的某个 span 用满了，它会向 `mcentral` 换一个有空位的 span。`mcentral` 按 `spanClass` 划分，每个 class 有自己的 span 集合。
+
+`mcentral` 自身并不保存每个空闲对象，它管理的是一批 `mspan`：
+
+```text
+mcentral(spanClass=N)
+  |
+  +-- partial: 还有空槽位的 span
+  |
+  +-- full:    当前没有空槽位的 span
+```
+
+源码中还把这些集合分成 swept 和 unswept 两组，用来配合并发清扫。GC 结束后，并不是所有 span 都立刻被清扫完；分配器在拿 span 时可能顺手清扫需要的 span，这叫 lazy sweeping。
+
+#### mheap：全局页级堆
+
+如果 `mcentral` 也拿不到合适的 span，就要向 `mheap` 申请页。`mheap` 是全局堆管理器，负责：
+
+- 管理页级分配器。
+- 维护所有 size class 的 `mcentral`。
+- 维护 heap arena 元数据。
+- 向操作系统申请或归还内存。
+- 管理 span 的生命周期和 sweep 状态。
+- 为大对象直接分配 span。
+
+大对象不经过 `mcache/mcentral`，会直接走 `mheap`：
+
+```text
+large object
+  |
+  v
+计算需要多少页
+  |
+  v
+mheap.alloc
+  |
+  v
+得到一个专用 mspan
+```
+
+这样做的原因是大对象本身已经足够大，不适合塞进小对象 size class 的槽位里；直接按页分配更简单，也减少内部碎片。
+
+#### mallocgc主流程
+
+`mallocgc` 是堆分配的核心入口。它不是只做“找一块内存”这么简单，还要和 GC、类型元数据、内存清零、profile、race/asan/msan 等机制协作。
+
+这里的几个源码名先简单对齐一下：`zerobase` 是零大小对象共用的哑地址；`gcBlackenEnabled` 表示当前是否处于需要把对象标记变黑的 GC 标记阶段；race/asan/msan 是数据竞争和内存错误检测工具的插桩路径。
+
+简化流程如下：
+
+```text
+mallocgc(size, typ, needzero)
+  |
+  +-- size == 0：返回 zerobase
+  |
+  +-- 如果 GC 正在标记：扣除当前 G 的 assist credit
+  |
+  +-- 根据 size 和 typ.Pointers() 选择分配路径
+  |     |
+  |     +-- tiny: 极小 noscan 对象合并进 tiny block
+  |     +-- small noscan: size class + noscan span
+  |     +-- small scan: size class + scan span + 类型/bitmap 元数据
+  |     +-- large: mheap 直接分配
+  |
+  +-- 必要时清零
+  |
+  +-- 发布前保证对象和 heap bits 初始化完成
+  |
+  +-- 如果写屏障开启：新对象直接标黑
+  |
+  +-- 记录 profile / sanitizer / 统计信息
+  |
+  +-- 如果达到触发条件：gcStart
+```
+
+`typ` 是否包含指针会影响分配路径。含指针对象需要让 GC 知道哪些字段是指针；不含指针对象则可以进入 noscan 路径，降低后续扫描成本。
+
+#### tiny allocator
+
+tiny allocator 处理极小且不含指针的对象。它会把多个小对象合并到一个小块里，减少分配次数和元数据开销。
+
+可以把它看成一个小拼盘：
+
+```text
+tiny block
+
++------+------+--------+---------+
+|  3B  |  5B  |   2B   |  free   |
++------+------+--------+---------+
+   a      b       c
+
+tinyoffset 指向下一个可放入的位置
+```
+
+典型目标包括：
+
+- 很小的字符串相关对象。
+- 逃逸的独立小变量。
+- 不含指针的小结构体。
+
+约束也很清楚：tiny 对象必须是 noscan。因为多个对象会共享一个 tiny block，只要其中一个子对象还活着，整个 block 就不能回收。如果对象里有指针，GC 精确性和浪费边界都会变复杂。
+
+#### 分配和GC的耦合
+
+分配器和 GC 的关系非常紧：
+
+```text
+分配器需要 GC：
+  - 知道什么时候触发下一轮 GC
+  - 在并发标记时执行 assist
+  - 分配期间维护对象颜色
+  - sweep 后复用空槽位和空 span
+
+GC 需要分配器：
+  - 通过 span 找到对象大小和边界
+  - 通过 bitmap/type 信息知道哪些字段是指针
+  - 通过 allocBits/gcmarkBits 区分已分配和已标记对象
+  - 通过 mheap/arena 元数据从地址反查对象
+```
+
+所以 Go 的内存分配器不是普通库函数。它是 runtime 的中心模块之一，调度器、GC、栈管理、类型系统都会和它发生关系。
+
 ### 12 Span、Heap与Arena
+
+理解 Go 堆，最好从三个层次看：
+
+```text
+对象 object
+  |
+  v
+span: 一段连续页，切成同大小对象槽位，或专门服务一个大对象
+  |
+  v
+heap: runtime 管理的页级堆，由 mheap 统筹
+  |
+  v
+arena: 按大块虚拟地址划分的堆区域和元数据索引
+```
+
+用一个不严谨但好记的类比：
+
+```text
+arena
+  一片仓库园区，代表一大段连续的堆地址空间。
+
+heapArena
+  这片园区的地图。地图本身不是货物，它记录每块地属于哪排货架、哪里有标记位图。
+
+page
+  园区里的地砖。runtime 切 span 时按连续地砖来切。
+
+span
+  一排连续货架。小对象 span 会把货架切成很多同规格格子。
+
+object
+  放进格子里的货物。用户代码真正拿到的是 object 的地址。
+```
+
+如果画成内存布局，大概是：
+
+```text
+arena address range
+
++------------------------------------------------------------------+
+| page | page | page | page | page | page | page | page | page ... |
++------------------------------------------------------------------+
+  \______________/   \____________________/   \__________________/
+      span A                span B                    span C
+   16B objects           32B objects              large object
+
+heapArena metadata
+
++------------------------------+
+| page -> span mapping         |
+| alloc / mark bitmap metadata |
+| page in-use information      |
++------------------------------+
+```
+
+注意，`heapArena` 不是“堆里的另一块业务内存”。它更像 runtime 放在旁边的索引表。GC 拿到一个地址时，要靠这些索引快速判断这个地址是不是 Go 堆对象、对象边界在哪里、对应哪个 span。
+
+#### page与span
+
+Go runtime 的堆按页管理。源码注释中 `mheap` 以 8192 字节页粒度管理堆。`mspan` 表示一段连续页：
+
+```text
+mspan
+  startAddr    span 起始地址
+  npages       包含多少页
+  elemsize     每个对象槽位大小
+  nelems       当前 span 可容纳多少对象
+  spanclass    size class + scan/noscan
+  allocBits    对象槽位是否已分配
+  gcmarkBits   当前 GC 周期对象是否被标记
+  freeindex    下次查找空槽位的起点
+  allocCache   加速查找空槽位的位缓存
+  sweepgen     和 mheap.sweepgen 配合判断清扫状态
+  state        mSpanInUse / mSpanManual / mSpanDead
+```
+
+`state` 可以先这样理解：
+
+```text
+mSpanInUse    普通堆对象正在使用的 span
+mSpanManual   runtime 手动管理的 span，例如某些栈内存，不按普通堆对象分配
+mSpanDead     空闲或未使用的 span
+```
+
+小对象 span 会被切成固定大小的槽位：
+
+```text
+span for 32-byte objects
+
++----+----+----+----+----+----+----+----+
+| 32 | 32 | 32 | 32 | 32 | 32 | 32 | 32 |
++----+----+----+----+----+----+----+----+
+  ^         ^
+  allocated free
+```
+
+更接近分配器视角时，它不是看“格子画得漂不漂亮”，而是看位图：
+
+```text
+slot:       0 1 2 3 4 5 6 7
+allocBits:  1 1 0 1 0 0 1 0
+freeindex:      ^
+                从这里附近继续找空槽
+
+allocCache:
+  缓存后续一段槽位的空闲情况，方便用位运算快速找到下一个 0
+```
+
+`freeindex` 像书签，避免每次都从 slot 0 开始找空位；`allocCache` 像一小段预读缓存，让分配器少扫内存、多用位运算。
+
+大对象 span 则通常是一整个对象占用一个或多个页：
+
+```text
+large object span
+
++--------------------------------------+
+|            one large object           |
++--------------------------------------+
+```
+
+#### allocBits与gcmarkBits
+
+`allocBits` 和 `gcmarkBits` 是理解 sweep 的关键。
+
+```text
+allocBits:   哪些槽位已经被分配
+gcmarkBits:  本轮 GC 标记阶段哪些槽位可达
+```
+
+标记结束后：
+
+- `gcmarkBits=1` 的对象仍然存活。
+- `allocBits=1` 但 `gcmarkBits=0` 的对象不可达，可以回收。
+
+清扫 span 时，runtime 会根据标记结果更新可分配状态。一个简化视角是：
+
+```text
+GC mark phase:
+  标记活对象 -> gcmarkBits
+
+sweep phase:
+  对比 allocBits 和 gcmarkBits
+  未标记对象变成空闲槽位
+  为下一轮 GC 准备新的 bitmap
+```
+
+这就是为什么 span 必须知道自己的对象大小、对象数量、位图和 sweep generation。GC 不是拿着一个裸地址就能回收内存，它要通过 span 元数据理解这段地址的结构。
+
+#### sweepgen
+
+`mheap` 有一个全局 `sweepgen`，`mspan` 也有自己的 `sweepgen`。它们配合表示 span 是否需要清扫、是否正在清扫、是否已经清扫并可用。
+
+可以不用记住每个数值，只要记住：
+
+```text
+span.sweepgen 落后于 mheap.sweepgen
+  -> 这个 span 属于上一轮结果，还没清扫
+
+span.sweepgen 等于 mheap.sweepgen
+  -> 已清扫，可以安全使用
+
+span 被 mcache 缓存
+  -> 会用特殊 generation 表示，避免被并发 sweeper 误处理
+```
+
+用表格看更像一个“清扫进度戳”：
+
+```text
+mheap.sweepgen = 42
+
+span A  sweepgen=40   未清扫，需要 sweep
+span B  sweepgen=41   正在被某个 sweeper 处理
+span C  sweepgen=42   已清扫，可以分配
+span D  mcache 持有   暂时归本地缓存管理
+```
+
+具体数值不是重点，重点是 runtime 不靠“我记得扫过它”这种模糊状态，而是用 generation 判断每个 span 在当前 GC 周期里走到哪一步。
+
+这个设计让清扫可以并发、懒惰地进行。分配器拿 span 前先确认它已经清扫；后台 sweeper 也可以逐个 span 清扫。
+
+#### heapArena
+
+Go 堆的虚拟地址空间被划分为 arena。源码注释中，heap arena 在 64 位平台通常是 64MB，在 32 位平台通常是 4MB。每个 arena 有一个对应的 `heapArena` 元数据对象，存放这块地址范围的索引和位图。
+
+可以抽象为：
+
+```text
+virtual address space
+
++----------+----------+----------+----------+
+| arena 0  | arena 1  | arena 2  | arena 3  |
++----------+----------+----------+----------+
+     |          |          |
+     v          v          v
+ heapArena  heapArena  heapArena
+```
+
+`heapArena` 里重要的元数据包括：
+
+```text
+spans        arena 内每个 page 对应哪个 mspan
+pageInUse    哪些 span 处于使用状态
+pageMarks    哪些 span 有标记对象
+pageSpecials 哪些 span 有 finalizer 等 special 记录
+bitmap       堆指针位图相关信息
+```
+
+这里的 special 记录指 runtime 挂在对象旁边的额外记录，例如 finalizer、profile 相关信息等；它不是对象本体字段，但 GC 和回收时需要看见它。
+
+堆位图可以粗略想成“对象字段扫描表”。例如：
+
+```text
+type Node struct {
+	next *Node
+	val  int
+}
+
+object Node in heap
+
+offset 0   next pointer   bitmap=1   GC 要沿着它继续标记
+offset 8   val  int       bitmap=0   普通整数，跳过
+```
+
+实际实现会结合类型元数据、span 信息和 bitmap 编码；这里的重点是：GC 扫描堆对象时也不是盲扫字节，而是知道哪些位置可能是指针。
+
+这些元数据本身通常在 Go 堆外管理，因为 GC 需要在扫描堆对象时依赖它们，不能让它们像普通对象一样被移动或回收。
+
+#### 地址如何反查对象
+
+GC 扫描时经常拿到一个地址，需要判断它是不是 Go 堆指针、属于哪个对象、对象边界在哪里。这个过程可以简化为：
+
+```text
+address p
+  |
+  v
+计算 arena index
+  |
+  v
+mheap_.arenas 找到 heapArena
+  |
+  v
+根据 page index 找到 mspan
+  |
+  v
+根据 span.elemsize 计算对象起始地址和槽位编号
+  |
+  v
+检查 allocBits / gcmarkBits / 类型信息
+```
+
+这也是为什么堆被组织成 arena、page、span 多级结构。它不是为了让概念复杂，而是为了让 runtime 能快速从任意地址定位到对象元数据。
+
+#### spanClass和noscan
+
+同一个 size class 会被拆成 scan 和 noscan 两类 span：
+
+```text
+size class 24 bytes
+  |
+  +-- scan span:   对象可能包含指针，GC 要扫描
+  |
+  +-- noscan span: 对象不包含指针，GC 可跳过对象内容
+```
+
+这对性能影响很大。假设程序分配了一个 100MB 的 `[]byte` 底层数组，它可能占用很多内存，但不含堆指针。GC 不需要把这 100MB 当成指针数组逐字检查。真正影响标记成本的是“可扫描内存”和“指针数量”，不只是堆占用字节数。
+
+#### mheap中的central数组
+
+`mheap` 持有所有 `mcentral`：
+
+```text
+mheap
+  central[spanClass 0]
+  central[spanClass 1]
+  central[spanClass 2]
+  ...
+```
+
+每个 `mcentral` 只服务一个 `spanClass`。当某个 `P.mcache` 需要新的 span 时，会通过 `mheap_.central[spc].mcentral.cacheSpan()` 获取。
+
+关系可以画成：
+
+```text
+P0.mcache.alloc[spc] ----\
+                         \
+P1.mcache.alloc[spc] -----> mheap.central[spc] -> mheap pages -> OS
+                         /
+P2.mcache.alloc[spc] ----/
+```
+
+`mcache` 让常见分配无锁，`mcentral` 让同类 span 集中管理，`mheap` 负责跨 class 的全局页资源。三层结构共同降低锁竞争和碎片。
+
 ### 13 GC原理
+
+Go 当前 GC 可以概括为：
+
+```text
+并发
+精确
+三色标记
+标记-清扫
+非分代
+非压缩
+依赖写屏障
+```
+
+这里的“精确”表示 runtime 知道哪些位置是指针，哪些不是指针；它不会把任意整数都当作指针。精确性的基础来自编译器生成的类型信息、栈图、堆 bitmap 和 runtime 元数据。
+
+#### 为什么需要GC
+
+堆对象的生命周期不一定和函数调用栈一致：
+
+```go
+func newNode(v int) *Node {
+	return &Node{Value: v}
+}
+```
+
+`Node` 在函数返回后仍然可能被外部使用，不能随着栈帧一起释放。手动管理这类对象容易出现重复释放、悬垂指针和内存泄漏。Go 选择自动 GC，让 runtime 根据可达性回收不再使用的堆对象。
+
+GC 要回答的问题是：
+
+```text
+从程序还能直接访问到哪些对象？
+从这些对象继续沿指针能访问到哪些对象？
+剩下访问不到的对象占用的内存能否复用？
+```
+
+#### 根对象
+
+标记从根对象开始。Go GC 的根大致包括：
+
+- 各 goroutine 栈上的指针。
+- 全局变量和包级变量里的指针。
+- 寄存器和调用现场中保存的指针。
+- runtime 自己维护的一些堆外结构中的堆指针。
+- finalizer、special record 等特殊引用。
+
+根对象不是“要回收的对象”，而是“搜索存活对象的起点”。
+
+```text
+roots
+  |
+  +-- goroutine stacks
+  +-- globals
+  +-- registers
+  +-- runtime off-heap references
+```
+
+根对象展开后，GC 看到的是一张对象图：
+
+```text
+stack slot ----> A ----> B
+global var ----> C ----> D
+register  -----> E
+
+X ----> Y   没有任何 root 能到达，标记结束后可以被 sweep 回收
+```
+
+#### 三色标记
+
+三色标记是一种理解标记过程的模型：
+
+```text
+white  尚未发现，标记结束后仍是 white 就会被回收
+grey   已发现，但它引用的对象还没扫描完
+black  已发现，并且它引用的对象也已经处理过
+```
+
+标记过程可以简化为：
+
+```text
+初始：所有对象 white
+  |
+  v
+把根引用到的对象标成 grey，放入工作队列
+  |
+  v
+不断取出 grey 对象
+  |
+  v
+扫描它的指针字段，把发现的 white 对象标成 grey
+  |
+  v
+当前对象扫描完，标成 black
+  |
+  v
+工作队列为空，标记结束
+```
+
+如果世界完全停止，这个算法很直观。但 Go 的目标是降低暂停时间，因此标记主要和用户 goroutine 并发执行。并发之后，问题变复杂了：用户代码可能在 GC 标记期间修改对象引用关系。
+
+#### 并发标记的问题
+
+假设 GC 已经把对象 `A` 扫描成 black，之后用户 goroutine 执行：
+
+```text
+A.ptr = B
+```
+
+如果 `B` 原来是 white，而 GC 不知道这次写入，就可能在标记结束时误以为 `B` 不可达，从而回收仍然被 `A` 引用的对象。
+
+危险画面是这样的：
+
+```text
+GC 已扫描完成 A
+
+black A  ----new pointer---->  white B
+   ^                              ^
+   |                              |
+不会再扫描 A                 B 还没被发现
+```
+
+写屏障要做的事，就是在这条新边出现时把 `B` 放进标记流程，避免它一直保持 white。
+
+并发标记要维持一个核心不变量：不能让黑色对象悄悄指向未被发现的白色对象。写屏障就是为这个问题服务的。它在指针写入时通知 GC，把相关对象标记或放入工作队列。
+
+#### 标记和清扫
+
+Go GC 是 mark-sweep，不是 copying GC。标记阶段只判断对象是否可达，不移动对象；清扫阶段回收未标记对象占用的槽位或 span。
+
+```text
+mark:
+  roots -> reachable objects
+  设置 gcmarkBits
+
+sweep:
+  对比 allocBits 和 gcmarkBits
+  未标记对象变成空闲
+  空 span 归还给 mheap
+  部分空闲 span 回到 mcentral
+```
+
+把 sweep 放到 span 里看会更清楚。假设一个 span 被切成 8 个对象槽位：
+
+```text
+GC 标记前，allocBits 表示哪些格子当前被分配：
+
+slot:      0 1 2 3 4 5 6 7
+allocBits: 1 1 1 1 0 1 0 1
+
+GC 标记后，gcmarkBits 表示哪些已分配对象仍然可达：
+
+slot:       0 1 2 3 4 5 6 7
+gcmarkBits: 1 0 1 0 0 1 0 0
+```
+
+sweep 做的事就是对账：
+
+```text
+slot 0: alloc=1 mark=1  活着，保留
+slot 1: alloc=1 mark=0  死了，变成空闲
+slot 2: alloc=1 mark=1  活着，保留
+slot 3: alloc=1 mark=0  死了，变成空闲
+slot 5: alloc=1 mark=1  活着，保留
+slot 7: alloc=1 mark=0  死了，变成空闲
+```
+
+清扫后，这个 span 不是被“删除”，而是多出了一些空格子，可以继续给同一个 size class 的对象复用。如果整个 span 的对象都死了，它才可能整体回到 `mheap`，以后被改造成别的用途。
+
+因为对象不移动，所以 Go 不做堆压缩。优点是对象地址稳定，和 `unsafe`、cgo、系统调用等场景协作更简单；缺点是需要靠 size class、span 管理和页回收控制碎片。
+
+#### STW与并发
+
+Go GC 不是完全无暂停。它仍然需要短暂 STW 来完成阶段切换：
+
+```text
+sweep termination:
+  STW，结束上一轮残留 sweep，准备进入 mark
+
+mark:
+  大部分与用户 goroutine 并发执行
+
+mark termination:
+  STW，确认标记完成，关闭标记相关机制，准备 sweep
+
+sweep:
+  与用户 goroutine 并发执行
+```
+
+GC 的优化重点不是把 STW 变成绝对 0，而是把长时间工作移到并发阶段，让暂停时间主要由阶段切换、根处理准备、统计更新等短任务组成。
+
+#### GC触发
+
+最常见的触发来自堆增长。`GOGC` 控制下一轮 GC 的目标堆大小，默认值是 100。一个简化公式是：
+
+```text
+下一轮目标堆大小 ≈ 上一轮存活堆大小 * (1 + GOGC / 100)
+```
+
+例如上一轮 GC 后存活堆是 100MB，`GOGC=100`，那么目标堆大小大约是 200MB。为了让并发标记有时间完成，GC 不会等到真正达到目标才开始，而是由 pacer 提前计算 trigger。
+
+触发来源可以概括为：
+
+```text
+heap trigger    堆增长达到 pacer 计算的触发点
+time trigger    长时间没有 GC 时的周期性触发
+cycle trigger   runtime.GC 等强制触发
+memory limit    GOMEMLIMIT 软内存限制影响 heap goal
+```
+
+#### GC成本看什么
+
+直觉上很多人只看堆大小，但 GC 成本更接近：
+
+```text
+GC标记成本 ≈ 根扫描成本 + 可扫描堆对象成本 + 指针边数量成本
+```
+
+几个结论：
+
+- 大量 `[]byte` 占内存，但本身不含指针，标记扫描成本相对低。
+- 大量小对象如果彼此用指针连接，标记成本可能高。
+- 大量 goroutine 栈会增加根扫描成本。
+- 对象分配越快，GC 越需要更早开始，或者让分配者 assist。
+- 降低临时堆分配，通常比单纯调 `GOGC` 更根本。
+
 ### 14 GC实现
+
+GC 的主流程在 `runtime/mgc.go`。源码开头已经给出了高层算法：并发 mark and sweep，使用 write barrier，非分代，非压缩，小对象通过每 P 的分配区域降低锁竞争。
+
+源码入口可以先看这些：
+
+```text
+runtime/mgc.go        gcStart、gcMarkDone、gcSweep、GC phase
+runtime/mgcmark.go    gcDrain、gcAssistAlloc、mark worker
+runtime/mgcpacer.go   gcController、heapGoal、trigger、assist ratio
+runtime/mbarrier.go   write barrier 说明和 bulk barrier
+runtime/mbitmap.go    heap bitmap、findObject、bulkBarrierPreWrite
+runtime/mheap.go      span sweepgen、allocBits、gcmarkBits
+```
+
+#### GC状态
+
+Go runtime 用 `gcphase` 表示当前 GC 阶段，核心状态可以简化为：
+
+```text
+_GCoff
+  GC 标记未运行
+  write barrier 关闭
+  后台 sweep 可以进行
+
+_GCmark
+  并发标记中
+  write barrier 开启
+  新对象分配为 black
+  background mark worker 和 mutator assist 工作
+
+_GCmarktermination
+  标记终止阶段
+  STW
+  write barrier 仍开启
+  做收尾、统计、切换到 sweep
+```
+
+#### 一轮GC的源码流程
+
+从 `gcStart` 开始，一轮 GC 可以抽象为：
+
+```text
+1. 触发检查
+   gcTriggerHeap / gcTriggerTime / gcTriggerCycle
+
+2. sweep termination
+   stopTheWorld
+   finishsweep_m
+   清理上一轮未完成 sweep
+
+3. 准备 mark
+   gcController.startCycle
+   setGCPhase(_GCmark)
+   gcBgMarkPrepare
+   gcPrepareMarkRoots
+   gcMarkTinyAllocs
+   开启 gcBlackenEnabled
+
+4. startTheWorld
+   用户 goroutine 继续运行
+   写屏障已经开启
+
+5. concurrent mark
+   background mark workers 扫描对象
+   mutator assist 在分配时帮忙标记
+   root marking 扫描栈、全局变量、runtime 数据
+   gcDrain 消耗灰色对象队列
+
+6. mark done
+   检测没有 root job 和 grey object
+   进入 mark termination
+
+7. mark termination
+   stopTheWorld
+   setGCPhase(_GCmarktermination)
+   关闭 assist 和 worker
+   更新统计信息
+   刷新 mcache 等状态
+
+8. 准备 sweep
+   setGCPhase(_GCoff)
+   gcSweep 设置 sweepgen
+   唤醒后台 sweeper
+
+9. startTheWorld
+   用户 goroutine 继续运行
+   sweep 与分配并发进行
+```
+
+这个流程里两次 STW 很关键：一次在进入标记前，保证所有 `P` 都能看到写屏障已经开启；一次在标记完成后，保证不会再有未处理的标记工作，并完成阶段切换。
+
+#### 后台标记worker
+
+并发标记不是一个单独线程从头扫到尾，而是调度器配合运行 GC worker。大致有几类 worker：
+
+```text
+dedicated mark worker
+  专门执行标记工作，目标是提供稳定 GC CPU
+
+fractional mark worker
+  按比例占用某些 P 的时间，补齐目标利用率
+
+idle mark worker
+  在 P 没有普通 goroutine 可运行时执行 GC 工作
+
+mutator assist
+  用户 goroutine 分配太快时，自己做一部分标记工作
+```
+
+可以把标记工作的来源画成：
+
+```text
+GC work queue
+   ^
+   |
+   +-- dedicated worker   稳定消耗 GC 工作
+   +-- fractional worker  按比例补足 GC CPU
+   +-- idle worker        P 空闲时顺手做
+   +-- mutator assist     分配者欠债时被拉来做
+```
+
+`mgcpacer.go` 里默认后台标记目标利用率是 `GOMAXPROCS` 的一部分，源码常量里可以看到 25% 这个目标。实际执行会结合专用 worker、fractional worker、idle worker 和 assist 共同完成。
+
+#### mutator assist
+
+mutator 指用户程序本身。GC 并发标记时，如果用户 goroutine 不断快速分配，堆增长可能跑在标记前面。为避免 GC 永远追不上，Go 使用 allocation assist。
+
+分配路径中可以看到：
+
+```text
+mallocgc
+  |
+  +-- gcBlackenEnabled != 0
+        |
+        v
+      deductAssistCredit(size)
+        |
+        v
+      如果欠债太多，当前 G 执行 gcAssistAlloc
+```
+
+直观理解：
+
+```text
+你分配得越多，就越需要帮 GC 做一些扫描工作。
+```
+
+这不是惩罚，而是背压机制。它让分配速度和标记速度保持相对平衡，避免到了 heap goal 还没标记完，最终被迫长时间 STW。
+
+用一个时间线看更直接：
+
+```text
+G1 正在执行业务代码
+  |
+  v
+make([]*Node, 10000) 触发较多堆分配
+  |
+  v
+当前处于 _GCmark，GC 正在并发标记
+  |
+  v
+mallocgc 发现 G1 的 assist credit 不够
+  |
+  v
+G1 暂停继续分配，进入 gcAssistAlloc
+  |
+  v
+从 GC 工作队列取一些灰色对象，扫描它们的指针字段
+  |
+  v
+还清一部分 assist debt
+  |
+  v
+回到 mallocgc，继续完成这次分配
+```
+
+所以 mutator assist 干的活不是“清理自己刚分配的对象”，而是帮当前 GC 周期推进标记工作。它可能扫描的是别的对象，只要这些对象在 GC 工作队列里。用户能感受到的是：某次分配突然变慢，因为这个 goroutine 被拉去帮 GC 还债了。
+
+#### 根标记和栈扫描
+
+标记阶段会准备 root jobs，包括：
+
+- 扫描 goroutine 栈。
+- 扫描全局变量。
+- 扫描 runtime 堆外结构里的堆指针。
+
+栈扫描需要让目标 goroutine 处在可扫描状态。运行中的 goroutine 可能需要被抢占到安全点；已经阻塞的 goroutine 通常更容易扫描，但也要注意它是否正在 channel 操作等特殊状态。
+
+栈扫描过程依赖编译器元数据：
+
+```text
+函数 PC
+  |
+  v
+找到对应函数元数据
+  |
+  v
+找到当前安全点的 stack map
+  |
+  v
+知道哪些栈槽是指针
+```
+
+画成栈扫描就是：
+
+```text
+goroutine stack
+
+frame main.main      stack map: [ptr, scalar, ptr]
+  slot0 -> heap A    扫描，标记 A
+  slot1 = 10         跳过
+  slot2 -> heap B    扫描，标记 B
+
+frame handle         stack map: [scalar, ptr]
+  slot0 = fd         跳过
+  slot1 -> heap C    扫描，标记 C
+```
+
+GC 不会把栈上的每个整数都当指针试一遍；它按 PC 找到对应栈图，只扫描标成 pointer 的槽位。
+
+这就是 Go GC 能做到精确扫描的基础。
+
+#### gcDrain与工作队列
+
+标记时，灰色对象会被放入 GC work queue。`gcDrain` 的核心工作是：
+
+```text
+while 有灰色对象或 root job:
+  取一个 job
+  如果是 root job：扫描根
+  如果是 heap object：扫描对象指针字段
+  发现 white 对象：标记并入队
+```
+
+为了降低全局竞争，GC work 也有本地缓存和批量转移机制。每个 `P` 可以持有部分 GC work，必要时再和全局队列交换。
+
+#### sweep实现
+
+标记结束后，清扫并不要求一次性完成。Go 的 sweep 可以：
+
+- 后台 sweeper 逐个 span 清扫。
+- 分配器需要 span 时顺手清扫相关 span。
+- 如果下一轮 GC 要开始而还有未清扫 span，则先完成 sweep termination。
+
+清扫一个 span 时，runtime 会根据 `gcmarkBits` 判断哪些对象仍然存活，把不可达对象的槽位释放出来。结果可能有三种：
+
+```text
+span 里还有活对象，并且有空槽
+  -> 回到 mcentral partial
+
+span 里还有活对象，但没有空槽
+  -> 回到 mcentral full
+
+span 里没有活对象
+  -> 页归还 mheap，可被其他 size class 或大对象复用
+```
+
+这解释了为什么 Go 内存曲线里经常看到“对象已经不可达，但 RSS 不一定立刻下降”。GC 回收的是 Go 堆可复用空间；是否把物理页归还给 OS，还涉及 scavenger 和操作系统内存管理。
+
+#### runtime.GC做了什么
+
+`runtime.GC()` 会强制触发一次 GC cycle，并等待这轮 GC 和相关 sweep 进展到足够完成的状态。它不是普通业务逻辑里应该频繁调用的性能优化手段。
+
+适合了解的场景包括：
+
+- benchmark 前后人为稳定堆状态。
+- 测试 finalizer 或内存释放行为。
+- 特殊工具或诊断代码。
+
+常规服务里频繁调用 `runtime.GC()` 往往只是把自动 pacer 的策略打乱，增加 CPU 和暂停成本。
+
 ### 15 写屏障与GC Pacer
+
+写屏障和 pacer 是 Go 并发 GC 的两个关键支点：
+
+```text
+写屏障：保证并发标记的正确性
+pacer：保证 GC 在合适时间开始，并以合适速度完成
+```
+
+没有写屏障，并发标记会漏标对象。没有 pacer，GC 可能开始太晚导致内存暴涨，也可能开始太早导致 CPU 浪费。
+
+#### 写屏障解决什么问题
+
+GC 标记和用户 goroutine 并发执行时，用户代码可能随时改指针：
+
+```go
+obj.next = other
+```
+
+如果这次写入发生在 GC 已经扫描过 `obj` 之后，GC 需要知道 `other` 可能因此变成可达。写屏障就是编译器在指针写入附近插入的一小段 runtime 协作逻辑。
+
+概念上可以理解为：
+
+```text
+写入前：
+  obj.next(slot) ---> old
+  ptr -----------> new
+
+写入时：
+  shade(old)     保护被覆盖的旧指针
+  shade(new)     保护即将写入的新指针
+  obj.next = new
+
+writePointer(slot, ptr):
+  shade(*slot)   // 被覆盖掉的旧指针
+  shade(ptr)     // 即将写入的新指针
+  *slot = ptr
+```
+
+Go 源码注释把它描述为混合写屏障：结合 Yuasa deletion barrier 和 Dijkstra insertion barrier。删除屏障关注被覆盖的旧指针，插入屏障关注新写入的指针。二者配合，防止 mutator 在并发标记期间把白色对象藏起来。
+
+#### 编译器何时插入写屏障
+
+写屏障不是每次赋值都有。它主要针对可能把堆指针写入堆对象或全局变量的操作。
+
+例如：
+
+```go
+type Node struct {
+	next *Node
+}
+
+func link(a, b *Node) {
+	a.next = b
+}
+```
+
+如果 `a` 指向堆对象，`a.next = b` 在 GC 标记期间就需要写屏障。编译器通常会生成类似这样的逻辑：
+
+```text
+if writeBarrier.enabled {
+	runtime.gcWriteBarrier(...)
+} else {
+	普通指针写入
+}
+```
+
+而写当前函数栈帧上的局部变量，通常不需要写屏障，因为当前 goroutine 的栈会作为根扫描。对于 `typedmemmove`、`typedmemclr`、slice copy、reflect 等批量移动或清零指针的操作，runtime 还有 bulk barrier 入口。
+
+```text
+单个指针写：
+  a.next = b
+  -> gcWriteBarrier
+
+批量移动含指针内存：
+  copy(dstObjects, srcObjects)
+  -> bulkBarrier 覆盖整段 dst/src 指针范围
+```
+
+#### 为什么新对象分配为黑色
+
+并发标记期间，新分配对象会被直接视为 black。这样做的意义是：新对象不会在本轮 GC 里被误回收，也不会要求 GC 立刻重新扫描所有刚分配出来的对象。
+
+分配路径里可以看到类似逻辑：
+
+```text
+if writeBarrier.enabled {
+  gcmarknewobject(span, uintptr(x))
+}
+```
+
+这和写屏障共同维护并发标记不变量。用户 goroutine 可以继续分配和写指针，GC 仍然能得到一个保守且正确的存活集合。
+
+#### 写屏障的成本
+
+写屏障开启后，指针写入会变慢一些。成本来自：
+
+- 每次指针写入前检查 `writeBarrier.enabled`。
+- 屏障需要把相关指针放入标记缓冲。
+- 缓冲满后要把工作提交给 GC。
+- 批量复制含指针对象时需要 bulk barrier。
+
+所以降低指针写入密度、减少堆上指针对象数量，也能间接降低 GC 成本。
+
+这也是为什么“少分配”之外，还要关注“少创建复杂指针图”。两个程序堆大小相近，指针密集程度不同，GC 压力可能完全不同。
+
+#### GC Pacer的目标
+
+Pacer 要解决三个问题：
+
+```text
+什么时候开始下一轮 GC？
+这轮 GC 的目标堆大小是多少？
+标记期间要让后台 worker 和 mutator assist 做多少工作？
+```
+
+`mgcpacer.go` 里的 `gcController` 维护了这些关键量：
+
+```text
+gcPercent        来自 GOGC
+memoryLimit      来自 GOMEMLIMIT
+heapLive         当前认为的 live heap
+heapMarked       上一轮标记后的存活堆
+heapScan         可扫描堆大小
+lastStackScan    上轮栈扫描量
+globalsScan      全局变量扫描量
+heapGoal         当前周期目标堆大小
+trigger          开始 GC 的堆大小
+assistWorkPerByte 每分配 1 字节需要承担多少扫描工作
+```
+
+把它想成 pacer 的仪表盘：
+
+```text
+内存进度条：
+
+heapMarked -------- trigger -------- heapLive -------- heapGoal
+上轮活堆           开始 GC          当前堆          本轮目标上限
+
+扫描进度条：
+
+已完成扫描 workDone -------------- 剩余扫描 workLeft
+
+pacer 根据两条进度条计算：
+  - GC 是否该启动
+  - 后台 worker 要跑多积极
+  - mutator 每分配 1B 要还多少 assist work
+```
+
+最简单的情况是只看 `GOGC`：
+
+```text
+heapGoal = liveHeap + liveHeap * GOGC / 100
+```
+
+默认 `GOGC=100`，意味着目标堆大约是上一轮存活堆的 2 倍。`GOGC` 越大，GC 越不频繁，CPU 压力通常下降，但内存占用上升；`GOGC` 越小，内存目标更紧，GC 更频繁。
+
+举个简化例子：
+
+```text
+上一轮 GC 后仍然活着的对象：100MB
+GOGC=100
+
+heapGoal ≈ 200MB
+```
+
+这句话的意思不是“到 200MB 才开始 GC”，而是“希望这一轮 GC 标记完成时，堆大致不要冲过 200MB”。因为 GC 标记和用户程序并发执行，标记期间用户还会继续分配，所以必须更早开始。
+
+#### trigger为什么小于goal
+
+如果等到 `heapLive == heapGoal` 才开始 GC，已经太晚了。并发标记需要时间，在标记期间用户 goroutine 还会继续分配。所以 pacer 会计算一个更早的 trigger：
+
+```text
+heapMarked ---------------- trigger ---------------- heapGoal
+上一轮存活堆             开始本轮 GC              希望标记结束时不要超过
+```
+
+trigger 和 heapGoal 之间的距离就是 GC 的 runway。runway 太短，GC 可能来不及完成，需要大量 assist 或更长暂停；runway 太长，GC 过早启动，吞吐下降。
+
+Pacer 会根据历史分配速度、扫描速度、上轮扫描工作量、当前堆增长情况动态调整。
+
+还是用上面的数字：
+
+```text
+heapMarked = 100MB
+heapGoal   = 200MB
+
+如果预计标记期间还会分配 40MB，
+那 trigger 可能会被放在 160MB 附近。
+
+160MB 开始标记
+  + 标记期间继续分配约 40MB
+  = 标记完成时接近 200MB
+```
+
+真实 runtime 的计算更复杂，但直觉就是这个：pacer 要给并发 GC 留出刹车距离。
+
+#### assist ratio
+
+标记期间，pacer 会计算一个 assist ratio：
+
+```text
+assistWorkPerByte = 剩余扫描工作 / 距离 heapGoal 还能分配的字节数
+```
+
+假设剩余扫描工作很多，而距离 heapGoal 已经很近，那么 assist ratio 会升高。结果是分配 goroutine 更容易欠下 assist debt，被迫执行更多标记工作。
+
+这会牺牲部分分配延迟，但避免堆无限增长或最终进入更糟糕的 STW。
+
+继续用同一个例子：
+
+```text
+距离 heapGoal 还能分配 20MB
+但 GC 估计还剩很多对象没扫描
+
+结果：
+  每分配一点内存，就要附带做更多标记工作
+  分配 goroutine 更容易进入 gcAssistAlloc
+```
+
+所以 pacer 不是“回收内存的算法”，而是 GC 的速度控制系统。它一边看堆增长速度，一边看标记完成进度，然后调节后台 worker 和 mutator assist 的压力。
+
+#### GOMEMLIMIT
+
+`GOMEMLIMIT` 给 Go runtime 一个软内存上限。它不是操作系统级硬限制，而是 pacer 在计算 heap goal 时会考虑的目标。内存限制会让 GC 更积极，也会推动 scavenger 归还不用的页。
+
+可以把 `GOGC` 和 `GOMEMLIMIT` 的关系理解成：
+
+```text
+GOGC       根据存活堆比例控制下一轮堆目标
+GOMEMLIMIT 在总内存目标上给 pacer 施加额外约束
+```
+
+当二者冲突时，runtime 会尝试在内存限制下运行，代价通常是更频繁的 GC、更高的 assist 压力和更低的吞吐。
+
+#### 写屏障与pacer如何配合
+
+整个并发 GC 能成立，靠的是多处协作：
+
+```text
+pacer 提前启动 GC
+  |
+  v
+STW 开启写屏障
+  |
+  v
+用户 goroutine 继续运行
+  |
+  +-- 指针写入走写屏障，维持标记正确性
+  |
+  +-- 新分配对象直接标黑
+  |
+  +-- 分配过快时执行 mutator assist
+  |
+  v
+后台 mark worker 消耗标记队列
+  |
+  v
+标记完成后 STW 收尾
+  |
+  v
+并发 sweep 回收未标记对象
+```
+
+如果只看某一个点，会觉得复杂；但从目标看很直接：在用户程序继续运行的同时，尽量正确、及时、低暂停地完成堆回收。
+
+#### 调优时看什么
+
+调 GC 之前，先确认问题是什么：
+
+```text
+内存占用太高
+  -> 看 live heap、GOGC、GOMEMLIMIT、对象是否长期被引用
+
+GC CPU 太高
+  -> 看分配速率、对象数量、指针密度、GOGC 是否过低
+
+延迟尖刺
+  -> 看 assist、STW pause、栈扫描、巨大对象扫描、调度阻塞
+
+RSS 不下降
+  -> 区分 Go heap 可复用、scavenger 归还、OS 是否真正回收物理页
+```
+
+常见优化方向不是一上来改环境变量，而是先减少无意义分配：
+
+- 让短生命周期对象留在栈上。
+- 复用临时 buffer。
+- 减少指针密集的小对象数量。
+- 用值类型或扁平结构替代大量链式对象。
+- 避免把大对象长时间挂在全局缓存里。
+- 对高频路径做 pprof/trace 验证，而不是凭感觉调参。
+
+#### 问答速览
+
+问题一：goroutine 栈为什么能动态增长？
+
+```text
+编译器在函数入口插入栈检查。空间不足时进入 morestack，runtime 切到 g0 栈执行 newstack，分配更大的连续栈，把旧栈已使用部分复制过去，并根据栈图和 runtime 元数据修正指向旧栈的指针。
+```
+
+问题二：小对象分配为什么通常很快？
+
+```text
+小对象按 size class 分配。当前 P 的 mcache 持有各 spanClass 的可分配 span，常见路径只需要在当前 span 的 bitmap 里找空槽位，不需要全局锁。mcache 用完再向 mcentral 取 span，mcentral 不足再向 mheap 取页。
+```
+
+问题三：span、heap、arena分别是什么？
+
+```text
+span 是一段连续页，是分配器和 GC 管理对象的基本单位；heap 是 runtime 通过 mheap 管理的全局页级堆；arena 是堆虚拟地址空间的大块划分，每个 heapArena 保存这块地址范围的 span map、bitmap 等元数据。
+```
+
+问题四：Go GC为什么需要写屏障？
+
+```text
+因为标记和用户 goroutine 并发执行。用户代码可能在 GC 已经扫描过某个对象后继续写入新指针。写屏障在指针写入时把旧指针或新指针通知给 GC，避免可达对象被错误地保持为白色并在 sweep 时回收。
+```
+
+问题五：GOGC=100是什么意思？
+
+```text
+可以近似理解为：下一轮 GC 的目标堆大小是上一轮存活堆的 2 倍。若上一轮标记后 live heap 是 100MB，GOGC=100 时 heap goal 大约是 200MB。实际 trigger 会更早，由 pacer 根据扫描速度、分配速度和内存限制计算。
+```
+
+问题六：为什么 GC 后内存不一定马上还给操作系统？
+
+```text
+GC sweep 首先把不可达对象占用的槽位或 span 变成 Go 堆可复用空间。是否把空闲页归还给 OS 由 scavenger 和操作系统共同决定。Go 程序内看到的 HeapAlloc、HeapIdle、HeapReleased、RSS 代表不同层面的内存状态，不能只看一个指标。
+```
 
 ## Part 4 Synchronization
 
