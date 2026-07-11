@@ -530,3 +530,118 @@ typedef struct zset {
 | **渐进式** | dict rehash 分摊到 CRUD，单线程也不阻塞 |
 | **编码自适应** | 小数据→紧凑编码，大数据→高效结构，自动切换 |
 | **空间换时间** | ZSet 双索引、SDS 预分配 |
+
+---
+
+## 补充：Redis 高级数据结构
+
+### Bitmap
+
+Bitmap 不是独立的 `type`，本质还是 String/SDS，只是把字符串当成连续 bit 数组使用。`SETBIT key offset value` 会把 `offset` 换算成字节下标 `offset >> 3` 和字节内 bit 位置，必要时扩容 SDS，再用位运算置 0/1；`GETBIT` 同理直接定位字节读取。`BITCOUNT`、`BITOP` 这类命令按字节批量扫描/计算，源码在 `bitops.c` 中还针对 popcount、AVX2/AVX512 做了优化。
+
+### HyperLogLog
+
+先把 HyperLogLog 想成一个**只记录统计特征、不保存原始元素**的数组。Redis 用 String 对象承载它，内容大致是：
+
+```text
+[hllhdr][register 0][register 1] ... [register 16383]
+```
+
+`PFADD user:uv alice` 时，不会把 `alice` 存进去，而是：
+
+1. 对 `alice` 做 64 位 hash。
+2. 取其中 14 bit 当数组下标，所以默认有 `2^14 = 16384` 个 register。
+3. 剩下的 bit 用来数“连续 0 的长度”，这个值越大，表示出现了越罕见的哈希形态。
+4. `register[index] = max(register[index], count)`。
+
+估算原理来自概率：随机 hash 中出现 1 个连续 0 的概率约 `1/2`，出现 2 个连续 0 的概率约 `1/4`，出现 k 个连续 0 的概率约 `1/2^k`。所以某个桶观察到的最长连续 0 越长，就暗示这个桶里大概率已经进来过 `2^k` 量级的不同元素。单个桶波动很大，HLL 才把数据拆成 16384 个桶分别观察，再用类似调和平均的方式合并，降低极端值影响。直观公式可以理解为：`估算基数 ≈ α * m^2 / Σ(2^-register[i])`，其中 `m` 是桶数。
+
+所以一个 HLL 记录的是“16384 个桶里各自见过的最长连续 0 长度”，而不是元素集合。`PFCOUNT` 根据这些 register 的分布反推出大概基数：桶越多被更新、数值越大，说明不同元素越多。dense 编码下每个 register 用 6 bit 打包，整体约 12KB；稀疏编码则压缩大量 0 register，数据变多后再转 dense。`PFMERGE` 就是把多个 HLL 的同下标 register 逐个取 max。
+
+### Geo
+
+Geo 用来给地点绑定经纬度，支持查坐标、算距离、按半径/矩形查附近地点，比如“附近的门店 / 车辆 / 用户”。Redis 没有为 Geo 新做底层结构，而是复用 ZSet：
+
+```text
+ZSet:
+  member = 地点名
+  score  = geohash(lon, lat) 得到的 52 bit 整数
+```
+
+`GEOADD shops 116.397 39.908 beijing` 的核心过程近似是：
+
+```text
+step = 26
+lon_index = normalize(116.397) * 2^26
+lat_index = normalize(39.908) * 2^26
+score = interleave(lat_index, lon_index)   // bit 交错，得到 52 bit
+ZADD shops score beijing
+```
+
+`normalize` 是把真实经纬度映射到整数网格；`interleave` 是把经度、纬度的 bit 交错。用 `step = 2` 的缩小版看，地图被切成 `4 x 4` 个格子：
+
+```text
+lat
+ 3 | .  .  .  .
+ 2 | .  .  C  .
+ 1 | .  .  A  B
+ 0 | .  .  .  .
+     0  1  2  3  lon
+```
+
+点 `A` 在 `(lon=2, lat=1)`：
+
+```text
+lon = 2 = 10
+lat = 1 = 01
+score bits = 1 0 0 1 = 1001   // 交错后的一维编号
+```
+
+整个小网格的一维编号大概是这样：
+
+```text
+lat
+ 3 | 0101  0111  1101  1111
+ 2 | 0100  0110  1100  1110
+ 1 | 0001  0011  1001  1011
+ 0 | 0000  0010  1000  1010
+       0     1     2     3   lon
+```
+
+这个顺序不是按距离排序，而是按“网格前缀”排序。同一个格子或大格子里的点会有相同前缀，因此能转成连续 score 区间。`GEOSEARCH` 时，Redis 根据半径选择格子大小，查中心格子和 8 个邻居对应的 ZSet score 区间，得到候选点后再计算真实距离过滤。所以 Geo 的底层支撑就是 `geohash + ZSet 范围查询 + 距离过滤`。
+
+### Stream
+
+Stream 用来做消息流 / 追加日志：生产者用 `XADD` 追加消息，消费者用 `XREAD` / `XREADGROUP` 按 ID 读取。每条消息本质是：
+
+```text
+streamID -> field-value 列表
+1690000000000-0 -> user=42, action=login
+```
+
+`streamID = ms-seq`，`ms` 是毫秒时间戳，`seq` 是同一毫秒内的递增序号，所以 ID 天然有序。
+
+底层不是“一条消息一个节点”，而是把一批连续消息压进 listpack，再用 rax 按 ID 给这些 listpack 建索引：
+
+```text
+stream
+  rax
+    1690000000000-0  -> listpack A
+    1690000000123-0  -> listpack B
+    1690000000456-0  -> listpack C
+```
+
+rax 的 key 是这个 listpack 的基准 ID，value 是一整块 listpack。`XRANGE 1690000000100-0 ...` 这类范围查询，可以先在 rax 里定位到对应 listpack，再在 listpack 内顺序扫，不需要从头遍历整个 Stream。
+
+listpack 里先放一个 master entry，保存公共字段名和统计信息。后面的消息如果字段名相同，就只存 value 和相对 ID：
+
+```text
+listpack
+  master: [count][deleted][num-fields][user][action][0]
+  entry1: [flags][ms-delta=0][seq-delta=0][42][login][lp-count]
+  entry2: [flags][ms-delta=5][seq-delta=0][43][pay][lp-count]
+```
+
+这样能省两类空间：ID 不存完整值，只存相对 master ID 的 `ms-delta/seq-delta`；字段名不重复存，常见日志字段只在 master entry 里放一份。`XADD` 通常追加到尾部 listpack，太大或条数太多时才新建一个 rax 节点。
+
+消费组也围绕 ID 建索引：group 记录 `last_id` 和全局 PEL，consumer 记录自己的 PEL。`XREADGROUP` 投递消息时加入 PEL，`XACK` 时从 PEL 删除，所以 Redis 能知道哪些消息“已投递但未确认”，支持后续重试 / 转移。
