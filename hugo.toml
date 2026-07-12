@@ -40,7 +40,7 @@ theme = 'PaperMod'
 
 [markup]
     [markup.highlight]
-        noClasses = true
+        noClasses = false
         style = 'github'
     [markup.goldmark]
         [markup.goldmark.extensions]
