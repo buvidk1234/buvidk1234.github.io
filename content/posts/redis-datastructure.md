@@ -1,5 +1,6 @@
 +++
 date = '2026-02-12T09:52:26+08:00'
+lastmod = '2026-07-14T00:00:00+08:00'
 draft = false
 title = 'Redis Datastructure'
 tags = ['Redis']
@@ -8,26 +9,34 @@ categories = ['数据库']
 
 # Redis 数据结构
 
-| 逻辑类型 (Type) | 底层数据结构 (Internal Encoding)     |
+本文按 Redis 8.x/unstable 源码写，重点看内存编码和自动转换。老版本里 ziplist、linkedlist 等编码已经不适合作为当前主线。
+
+| 逻辑类型 (Type) | 底层数据结构 (Internal Encoding) |
 | ----------- | ------------------------------ |
-| **String**  | int, embstr, raw (SDS)         |
-| **List**    | quicklist                      |
-| **Hash**    | listpack, hashtable            |
-| **Set**     | intset, hashtable              |
+| **String**  | int, embstr, raw (SDS) |
+| **List**    | listpack, quicklist |
+| **Hash**    | listpack, listpackEx, hashtable |
+| **Set**     | intset, listpack, hashtable |
 | **ZSet**    | listpack, skiplist + hashtable |
+| **Stream**  | rax + listpack |
 
 ```mermaid
 graph TD
     A[redisObject] --> B{type}
     B -->|STRING| C[int / embstr / raw]
-    B -->|LIST| D[quicklist]
+    B -->|LIST| D{size?}
     B -->|HASH| E{size?}
     B -->|SET| F{all int?}
     B -->|ZSET| G{size?}
+    B -->|STREAM| S[rax + listpack]
+    D -->|小| DL[listpack]
+    D -->|大| DQ[quicklist]
     E -->|小| H[listpack]
+    E -->|field TTL| HX[listpackEx / hashtable metadata]
     E -->|大| I[hashtable]
     F -->|yes & 少| J[intset]
-    F -->|no| K[hashtable]
+    F -->|no & 小| K[listpack]
+    F -->|大| FH[hashtable]
     G -->|小| L[listpack]
     G -->|大| M[skiplist + hashtable]
 ```
@@ -65,7 +74,7 @@ embstr 把 redisObject 和 SDS 分配在一块连续内存（≤44B），一次 
 
 ## Listpack
 
-ziplist 的替代方案，消除了级联更新问题。用作 Hash/ZSet/Stream 小数据量时的编码。
+ziplist 的替代方案，消除了级联更新问题。当前 Redis 里，listpack 既可以直接作为 List/Hash/Set/ZSet 的小对象编码，也可以作为 quicklist 节点和 Stream rax 节点里的紧凑载体。
 
 ```c
 /* 伪代码：Listpack 的物理布局 */
@@ -88,11 +97,35 @@ struct ListpackLayout {
 
 连续内存 → 零指针开销 → 缓存友好。代价是 O(N) 遍历，所以只用于小数据量。
 
+Hash 还有一个扩展编码 `listpackEx`。它不是新的逻辑类型，而是在 Hash 使用 field TTL 后，把原本的 field-value listpack 扩展成 field-value-ttl 三元组，并附带过期元数据：
+
+```c
+typedef struct listpackEx {
+    ExpireMeta meta;
+    void *lp;  /* listpack that contains field-value-ttl tuples */
+} listpackEx;
+```
+
+普通小 Hash 仍是 listpack；第一次对 listpack Hash 使用 `HEXPIRE`/`HPEXPIRE` 这类 field expiration 命令时，才会转换成 `OBJ_ENCODING_LISTPACK_EX`。如果 Hash 已经转成 hashtable，则过期信息挂在 dict metadata 和 ebuckets 上。
+
 ---
 
 ## Quicklist
 
-List 的唯一编码。本质：**listpack 节点组成的双向链表**。
+Quicklist 是 **listpack 节点组成的双向链表**。它解决的问题是：单个 listpack 太大时，中间插入/删除会搬移大量连续内存；拆成多个 listpack 节点后，每次只影响一个节点。
+
+当前 List 不是只有 quicklist 一种编码。小 List 可以直接是一个 listpack；数据增长到超过 `list-max-listpack-size` 限制时，Redis 把它转换成 quicklist。缩小后，如果 quicklist 只剩一个 packed node 且低于阈值，也可能转回 listpack。
+
+```text
+小 List:
+  redisObject(OBJ_LIST, LISTPACK) -> [a][b][c]
+
+变大后:
+  redisObject(OBJ_LIST, QUICKLIST)
+    -> quicklistNode(listpack)
+    -> quicklistNode(listpack)
+    -> quicklistNode(listpack)
+```
 
 ```c
 typedef struct quicklist {
@@ -199,7 +232,7 @@ static intset *intsetUpgradeAndAdd(intset *is, int64_t value) {
     is->encoding = intrev32ifbe(newenc);
     is = intsetResize(is,intrev32ifbe(is->length)+1);
 
-    /* 从后向前迎移，避免覆盖未迎移的数据。
+    /* 从后向前迁移，避免覆盖未迁移的数据。
      * prepend 变量确保在数组开头或末尾留出空位。 */
     while(length--)
         _intsetSet(is,length+prepend,_intsetGetEncoded(is,length,curenc));
@@ -225,9 +258,67 @@ static intset *intsetUpgradeAndAdd(intset *is, int64_t value) {
 
 ---
 
+## Set 的三种编码
+
+Set 现在有三条路径：`intset`、`listpack`、`hashtable`。创建时会根据第一个元素和 size hint 选择初始编码：
+
+```c
+robj *setTypeCreate(sds value, size_t size_hint) {
+    if (isSdsRepresentableAsLongLong(value,NULL) == C_OK &&
+        size_hint <= server.set_max_intset_entries)
+        return createIntsetObject();
+
+    if (size_hint <= server.set_max_listpack_entries)
+        return createSetListpackObject();
+
+    robj *o = createSetObject();
+    dictExpand(o->ptr, size_hint);
+    return o;
+}
+```
+
+也就是说：
+
+| 场景 | 编码 |
+|-|-|
+| 元素都能转整数，且数量不超过 `set-max-intset-entries` | intset |
+| 存在非整数元素，但数量和值长度仍小 | listpack |
+| 元素太多、单个值太长，或 listpack 不再安全扩容 | hashtable |
+
+默认阈值是 `set-max-intset-entries=512`、`set-max-listpack-entries=128`、`set-max-listpack-value=64`。它们是配置项，不是数据结构本身的硬限制。
+
+`SADD` 时的转换方向可以这样看：
+
+```text
+intset + 整数
+  -> 继续 intset；超过 intset 数量阈值则转 hashtable
+
+intset + 非整数
+  -> 如果整体仍适合 listpack，转 listpack
+  -> 否则转 hashtable
+
+listpack + 新元素
+  -> 如果 entries/value/安全扩容检查都通过，继续 listpack
+  -> 否则转 hashtable
+```
+
+所以旧说法“Set 小整数用 intset，否则用 hashtable”已经不完整。当前源码里，小的字符串 Set 会先用 listpack 节省指针和 dictEntry 开销。
+
+---
+
 ## Dict
 
-全局键空间、Hash、Set 的底层。拉链法 + **渐进式 rehash**。
+Dict 是 Redis 里最核心的哈希表实现，使用拉链法 + **渐进式 rehash**。大 Hash、大 Set 会直接用 dict；当前 DB keyspace 则先包了一层 `kvstore`：
+
+```c
+typedef struct redisDb {
+    kvstore *keys;      /* 当前 DB 的全部 key */
+    kvstore *expires;   /* 设置了 TTL 的 key */
+    estore *subexpires; /* sub-key 过期，目前主要用于 hash field */
+} redisDb;
+```
+
+`kvstore` 可以理解成“按索引组织的一组 dict”。Standalone 模式通常只需要一个 dict；Cluster 模式会把同一 hash slot 的 key 放到同一个 dict 里，方便按 slot 迁移、扫描和统计。下面看的 `dict` 是这一层真正的哈希表结构。
 
 ```c
 struct dict {
@@ -382,7 +473,7 @@ static void _dictRehashStepIfNeeded(dict *d, uint64_t visitedIdx) {
         return;
     /* rehashidx == -1 表示未在 rehash */
     if ((long)visitedIdx >= d->rehashidx && d->ht_table[0][visitedIdx]) {
-        /* 当前访问的 bucket 在 ht0 中有数据，就地迎移该 bucket（CPU 缓存友好） */
+        /* 当前访问的 bucket 在 ht0 中有数据，就地迁移该 bucket（CPU 缓存友好） */
         _dictBucketRehash(d, visitedIdx);
     } else {
         /* ht0 中该位置无数据，按 rehashidx 顺序推进一步（缓存不友好） */
@@ -399,7 +490,7 @@ static void _dictRehashStepIfNeeded(dict *d, uint64_t visitedIdx) {
 
 ```c
 /* dictRehash 和 dictBucketRehash 的辅助函数，
- * 将旧表 ht_table[0] 中下标为 idx 的 bucket 中所有 key 迎移到新表 */
+ * 将旧表 ht_table[0] 中下标为 idx 的 bucket 中所有 key 迁移到新表 */
 static void rehashEntriesInBucketAtIndex(dict *d, uint64_t idx) {
     dictEntry *de = d->ht_table[0][idx];
     uint64_t h;
