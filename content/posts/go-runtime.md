@@ -3748,9 +3748,1364 @@ GC sweep 首先把不可达对象占用的槽位或 span 变成 Go 堆可复用�
 ## Part 5 System Integration
 
 ### 21 Netpoll实现
+
+前面讲调度器时已经提到：goroutine 阻塞时，runtime 要尽量让线程继续干别的活。网络 I/O 是这个目标最典型的场景。
+
+如果一个 goroutine 在 socket `read` 上直接阻塞 OS 线程，那么大量连接会带来大量线程，GMP 模型的优势就没了。Go 的做法是：
+
+```text
+socket 设置为非阻塞
+  |
+  v
+read/write 先直接系统调用
+  |
+  +-- 成功：直接返回
+  |
+  +-- EAGAIN/EWOULDBLOCK：goroutine 挂到 runtime netpoll
+  |
+  v
+OS poller 发现 fd 可读/可写
+  |
+  v
+runtime 把等待的 goroutine 重新放回可运行队列
+```
+
+所以 netpoll 不是一个独立的网络库，而是 runtime、标准库 `net`/`internal/poll` 和操作系统事件通知机制之间的桥。
+
+#### 源码入口
+
+常见入口可以这样看：
+
+```text
+internal/poll/fd_unix.go
+  FD.Read / FD.Write
+  非阻塞 fd 的读写循环
+
+internal/poll/fd_poll_runtime.go
+  pollDesc
+  通过 go:linkname 调 runtime_pollOpen/runtime_pollWait
+
+runtime/netpoll.go
+  平台无关的 pollDesc、deadline、park/unpark 逻辑
+
+runtime/netpoll_epoll.go
+runtime/netpoll_kqueue.go
+runtime/netpoll_windows.go
+  各平台后端：epoll、kqueue、IOCP 等
+
+runtime/proc.go
+  调度器在 findRunnable、sysmon、STW 恢复时调用 netpoll
+```
+
+#### 从net.Conn.Read到runtime
+
+以 Unix 上的 TCP 读为例，调用链可以简化成：
+
+```text
+net.(*TCPConn).Read
+  |
+  v
+internal/poll.(*FD).Read
+  |
+  +-- readLock 防止同一个 fd 上多个读操作破坏状态
+  |
+  +-- pd.prepareRead
+  |
+  +-- syscall.Read
+        |
+        +-- 读到数据：返回
+        |
+        +-- EINTR：重试
+        |
+        +-- EAGAIN 且 fd 可 poll：
+              pd.waitRead
+                |
+                v
+              runtime_pollWait
+                |
+                v
+              netpollblock -> gopark
+```
+
+这里的关键点是：goroutine 不是在内核 `read` 里睡眠，而是在 runtime 里被 park。真正阻塞等待事件的是少量进入 `epoll_wait`、`kevent`、IOCP 等后端的 M。
+
+普通磁盘文件通常不是这条路径的重点。netpoll 主要服务 socket、pipe 以及其他可被操作系统事件机制监控的 fd。
+
+#### pollDesc是什么
+
+`pollDesc` 是 runtime 给一个 fd 配套的等待状态。它不是业务层的连接对象，而是调度器能理解的 I/O 等待描述符。
+
+最核心的是两个字段：
+
+```text
+rg  read goroutine 等待位
+wg  write goroutine 等待位
+```
+
+它们像两个二元信号量，分别管理读等待和写等待。状态大致有四种：
+
+```text
+pdNil
+  没有 goroutine 等待，也没有待消费的 ready 事件
+
+pdWait
+  goroutine 准备 park，但还没有真正挂上去
+
+G pointer
+  某个 goroutine 已经阻塞在这个 fd 的读或写方向上
+
+pdReady
+  OS 已经报告 ready，但 goroutine 还没消费这个通知
+```
+
+为什么要有 `pdWait` 这个中间态？因为 readiness 和 goroutine park 是并发发生的：
+
+```text
+goroutine 准备睡眠
+  |
+  +-- 还没真正睡下，OS 事件已经来了
+  |
+  v
+不能丢掉这次 ready 通知
+```
+
+`netpollblock` 用 CAS 在 `pdNil`、`pdWait`、G 指针、`pdReady` 之间切换，避免“刚准备睡，事件来了但没人记住”的丢事件问题。
+
+#### 打开、等待、关闭
+
+fd 被标准库初始化为 pollable 时，会调用 runtime 的 `poll_runtime_pollOpen`：
+
+```text
+poll_runtime_pollOpen(fd)
+  |
+  +-- 从 pollcache 取一个 pollDesc
+  +-- 初始化 fd、fdseq、rg、wg、deadline
+  +-- 调平台 netpollopen(fd, pd)
+  |
+  v
+把 fd 注册到 epoll/kqueue/IOCP
+```
+
+等待读写时：
+
+```text
+poll_runtime_pollWait(pd, 'r' 或 'w')
+  |
+  +-- netpollcheckerr 检查关闭、deadline、poll 错误
+  |
+  +-- netpollblock
+        |
+        +-- 如果已有 pdReady，消费后直接返回
+        |
+        +-- 否则把当前 G 挂到 rg/wg
+        |
+        +-- gopark，当前 M 去调度别的 G
+```
+
+关闭 fd 时，标准库会先 evict：
+
+```text
+FD.Close
+  |
+  v
+pd.evict -> runtime_pollUnblock
+  |
+  +-- 标记 closing
+  +-- 唤醒等待读/写的 goroutine
+  +-- 停掉 deadline timer
+```
+
+因此，一个阻塞在网络读上的 goroutine，可能因为三类原因被唤醒：
+
+```text
+fd 可读/可写       -> 正常继续系统调用
+deadline 到期      -> 返回超时错误
+fd 被关闭          -> 返回 closing 错误
+```
+
+#### 平台后端
+
+`runtime/netpoll.go` 定义的是平台无关契约：
+
+```text
+netpollinit()
+  初始化 poller
+
+netpollopen(fd, pd)
+  把 fd 注册到 OS poller，并把 pd 作为事件回调时的上下文
+
+netpollclose(fd)
+  从 OS poller 移除 fd
+
+netpoll(delay)
+  等待事件，返回可运行 goroutine 列表
+
+netpollBreak()
+  唤醒一个正在阻塞的 poller
+```
+
+不同系统实现不同：
+
+```text
+Linux    epoll + eventfd
+BSD/mac  kqueue + pipe/event
+Windows  IOCP
+Solaris  event ports
+```
+
+以 Linux 为例：
+
+```text
+netpollinit
+  |
+  +-- epoll_create1
+  +-- eventfd 创建唤醒 fd
+  +-- 把 eventfd 注册进 epoll
+
+netpollopen
+  |
+  +-- epoll_ctl ADD
+  +-- 关注 EPOLLIN、EPOLLOUT、EPOLLRDHUP、EPOLLET
+  +-- event data 中保存 pollDesc 指针和 fdseq
+
+netpoll
+  |
+  +-- epoll_wait
+  +-- 遍历事件
+  +-- 计算读/写 mode
+  +-- netpollready(pd, mode)
+```
+
+`fdseq` 用来防止 fd 或 `pollDesc` 复用导致的陈旧事件。一个 fd 关闭后，内核或 runtime 里仍可能残留旧事件；如果事件携带的 tag 和当前 `pollDesc` 的序号不一致，runtime 会丢弃它。
+
+#### netpollready如何唤醒goroutine
+
+平台后端拿到事件后，不直接操作调度队列，而是调用通用函数：
+
+```text
+netpollready(toRun, pd, mode)
+  |
+  +-- mode 包含读：netpollunblock(pd, 'r', ioready=true)
+  |
+  +-- mode 包含写：netpollunblock(pd, 'w', ioready=true)
+  |
+  +-- 返回被唤醒的 G 列表和 waiters delta
+```
+
+`netpollunblock` 做的事情可以理解成：
+
+```text
+如果 rg/wg 是 G 指针：
+  取出这个 G
+  把状态改成 pdReady 或 pdNil
+  返回 G，稍后 goready
+
+如果 rg/wg 是 pdNil：
+  说明当前没人等
+  对真正的 I/O ready，记录 pdReady
+
+如果 rg/wg 已经是 pdReady：
+  不重复记录
+```
+
+这保证了两种情况都不会丢：
+
+```text
+事件先到，goroutine 后等
+  -> pdReady 被后来的 wait 消费
+
+goroutine 先等，事件后到
+  -> G 被取出并重新变成 runnable
+```
+
+#### 调度器在哪里调用netpoll
+
+netpoll 和调度器不是两个世界。`findRunnable` 找不到普通 runnable G 时，会把网络事件也当作一种工作来源。
+
+简化流程如下：
+
+```text
+findRunnable
+  |
+  +-- local runq
+  +-- global runq
+  +-- 非阻塞 netpoll(0)
+  +-- work stealing
+  +-- idle GC worker
+  |
+  +-- 仍然没活：
+        release P
+        根据 timer 计算 delay
+        阻塞 netpoll(delay)
+```
+
+这里有几个细节：
+
+- 非阻塞 `netpoll(0)` 是优化路径，用来快速捞出已经 ready 的网络 G。
+- 真正要睡眠时，M 会先释放 P，再进入可能阻塞的 `netpoll(delay)`。
+- runtime 用 `sched.lastpoll`、`sched.pollingNet` 控制同一时间不要有太多 M 同时冲进内核 poller。
+- 如果更早的 timer 被加入，或者有新工作需要唤醒 poller，会通过 `netpollBreak` 打断阻塞中的 `epoll_wait`/`kevent`。
+
+所以网络事件最终仍然回到普通调度流程：
+
+```text
+OS event
+  |
+  v
+netpollready
+  |
+  v
+gList
+  |
+  v
+injectglist / goready
+  |
+  v
+run queue
+  |
+  v
+M 执行 goroutine
+```
+
+#### Deadline如何实现
+
+`SetReadDeadline`、`SetWriteDeadline` 并不是给每个 fd 设置内核级超时。Go 在 `pollDesc` 中保存读写 deadline，并配合 runtime timer 实现。
+
+简化流程：
+
+```text
+SetReadDeadline(t)
+  |
+  v
+runtime_pollSetDeadline(pd, d, 'r')
+  |
+  +-- 更新 pd.rd
+  +-- 修改 read deadline timer
+  +-- 如果 deadline 已经过期，直接 unblock 等待读的 G
+```
+
+deadline 到期时：
+
+```text
+timer fired
+  |
+  v
+netpolldeadlineimpl
+  |
+  +-- 把 pd.rd/pd.wd 标记为过期
+  +-- netpollunblock 等待的 G
+  |
+  v
+pollWait 返回 pollErrTimeout
+```
+
+这里有一个很重要的设计：deadline、close 和 OS ready 都走同一套 `pollDesc` 唤醒机制。它们唤醒 goroutine 的原因不同，但都要解决同一个问题：让阻塞在 I/O 等待上的 G 回到调度器。
+
+#### netpoll小结
+
+把 netpoll 放进 GMP 模型里看，它的职责很清楚：
+
+```text
+标准库负责：
+  把 fd 设为非阻塞
+  遇到 EAGAIN 时调用 pollWait
+
+runtime 负责：
+  保存 fd 与等待 goroutine 的关系
+  park/unpark goroutine
+  管理 deadline 和 close 唤醒
+  把 ready G 注入调度队列
+
+操作系统负责：
+  epoll/kqueue/IOCP 等事件通知
+```
+
+这也是 Go 可以用少量线程支撑大量网络连接的关键。
+
 ### 22 Syscall处理
+
+系统调用是 Go runtime 和内核之间最直接的边界。它看起来只是一次函数调用，但对调度器来说有三个问题：
+
+```text
+1. 系统调用可能阻塞 OS 线程
+2. 系统调用期间 goroutine 不再执行 Go 代码
+3. 系统调用参数里可能有 uintptr，GC 不能随便移动或增长栈
+```
+
+因此，Go 不能把系统调用当普通函数看。进入系统调用前，runtime 要记录状态；返回后，还要重新接入调度器。
+
+#### 普通Syscall路径
+
+一个普通系统调用可以抽象成：
+
+```text
+syscall.Syscall / x/sys/unix.Syscall
+  |
+  v
+runtime.entersyscall
+  |
+  v
+汇编 trap/syscall 指令进入内核
+  |
+  v
+内核执行系统调用
+  |
+  v
+runtime.exitsyscall
+  |
+  v
+回到 Go 代码
+```
+
+`entersyscall` 和 `exitsyscall` 的主要目的不是“执行系统调用”，而是告诉调度器：
+
+```text
+当前 G 进入 _Gsyscall
+当前 M 可能长时间停在内核里
+当前 P 必要时可以交给别的 M 使用
+GC 扫描这个 G 时要用保存好的 syscallpc/syscallsp
+```
+
+#### entersyscall做了什么
+
+`entersyscall` 的核心步骤：
+
+```text
+保存调用点 PC/SP/BP
+  |
+  v
+写入 gp.syscallpc / gp.syscallsp / gp.syscallbp
+  |
+  v
+设置 stackguard0 = stackPreempt，禁止在这段路径上分裂栈
+  |
+  v
+记录当前 P 的 syscalltick
+  |
+  v
+gp 状态从 _Grunning 切到 _Gsyscall
+  |
+  v
+必要时唤醒 sysmon
+```
+
+这里最容易忽略的是栈。
+
+系统调用参数可能通过 `uintptr` 传递。runtime 无法可靠判断某个 `uintptr` 到底只是整数，还是指向 Go 栈上的地址。如果此时栈增长或移动，内核手里可能还拿着旧地址。
+
+所以进入 syscall 后：
+
+```text
+不允许这条进入路径 split stack
+保存 syscallsp 供 GC 和 traceback 使用
+把 G 标成 _Gsyscall，表示它不再执行普通 Go 代码
+```
+
+这也是 `entersyscall` 必须走 `nosplit` 快路径的原因。
+
+#### P什么时候被交出去
+
+普通 `entersyscall` 不一定立刻释放 P。它先把 G 标成 `_Gsyscall`，M 仍可能短时间持有 P。如果系统调用很快返回，`exitsyscall` 可以直接继续用原来的 P，成本最低。
+
+如果系统调用阻塞变长，`sysmon` 会介入：
+
+```text
+M 进入 syscall
+  |
+  v
+P 暂时跟着 M
+  |
+  v
+sysmon 发现 P 长时间处于 syscall
+  |
+  v
+retake 抢回 P
+  |
+  v
+handoffp 把 P 交给其他 M
+```
+
+这就是为什么一个 goroutine 阻塞在系统调用里，通常不会把整个 Go 程序卡住。被卡住的是那个 OS 线程，不是 P 的长期执行权。
+
+对于 runtime 明确知道会阻塞的路径，可以用 `entersyscallblock`：
+
+```text
+entersyscallblock
+  |
+  +-- 先 handoffp(releasep())
+  |
+  +-- 再把 G 切到 _Gsyscall
+```
+
+它比普通 `entersyscall` 更主动：既然知道要阻塞，就尽快把 P 让出来。
+
+#### exitsyscall如何回来
+
+系统调用返回后，`exitsyscall` 要把 G 从 `_Gsyscall` 带回可执行世界：
+
+```text
+exitsyscall
+  |
+  +-- G 状态先从 _Gsyscall 切回 _Grunning
+  |
+  +-- 检查当前 M 是否还持有 P
+  |
+  +-- 如果原 P 还在：直接继续
+  |
+  +-- 如果 P 被 sysmon 拿走：尝试拿回 oldp
+  |
+  +-- 拿不到 oldp：尝试拿一个 idle P
+  |
+  +-- 仍拿不到：把 G 放回 runnable 队列，M 停下或调度别的 G
+```
+
+可以把它看成两条路径：
+
+```text
+快路径：
+  syscall 很快返回
+  P 没被拿走
+  清理 syscallsp
+  继续执行 Go 代码
+
+慢路径：
+  P 已经交给别人
+  当前 G 不能直接运行
+  进入 exitsyscallNoP
+  变成 _Grunnable，等待调度器重新分配 P/M
+```
+
+这解释了一个常见现象：系统调用返回不代表 goroutine 立刻继续执行。它还要先满足 GMP 的约束，也就是必须有 P 才能运行 Go 代码。
+
+#### syscalltick和sysmon
+
+`P.syscalltick` 是 runtime 用来判断 syscall 状态变化的计数。进入、退出或交接 syscall 时，runtime 会更新它。
+
+`sysmon` 周期性检查所有 P：
+
+```text
+如果 P 在 _Psyscall 状态
+  |
+  +-- syscalltick 没变化
+  +-- 停留时间超过阈值
+  |
+  v
+认为这个 P 可以被 retake
+```
+
+retake 的目标不是打断内核系统调用。Go 做不到也不应该这么做。它只是把 P 的执行权从阻塞线程旁边拿走，让其他 goroutine 能继续运行。
+
+#### RawSyscall为什么特殊
+
+`RawSyscall` 绕过 `entersyscall` / `exitsyscall` 的完整调度通知：
+
+```text
+RawSyscall
+  |
+  v
+直接 trap 到内核
+```
+
+它适合非常底层、确定很快返回、不能触发调度协作的场景。代价是 runtime 不知道当前 M 正在做一个可能阻塞的系统调用。
+
+如果把可能阻塞的调用放进 `RawSyscall`，后果通常是：
+
+```text
+M 被内核阻塞
+P 没被及时交出去
+其他 goroutine 可能被延迟
+STW/GC/trace 的协作信息也会变差
+```
+
+所以业务代码很少应该直接用 `RawSyscall`。大多数情况应该走标准库或 `x/sys/unix` 已经封装好的路径。
+
+#### Syscall与netpoll的关系
+
+网络 I/O 并不是每次都走“阻塞 syscall”。Go 标准库通常把 socket 设置成非阻塞：
+
+```text
+read(fd)
+  |
+  +-- 有数据：一次系统调用完成
+  |
+  +-- 没数据：返回 EAGAIN
+        |
+        v
+      runtime netpoll 等待 fd ready
+```
+
+这样做的好处是：等待网络事件时，G 被 park，M/P 可以去运行其他 G；只有真正执行 `read`/`write` 的瞬间才进入内核。
+
+这也是 Part 5 里 syscall 和 netpoll 要放在一起看的原因：
+
+```text
+阻塞式系统调用：
+  让线程睡在内核里，runtime 靠 entersyscall/exitsyscall 兜底
+
+非阻塞 fd + netpoll：
+  让 goroutine 睡在 runtime 里，线程还能继续调度
+```
+
+高并发网络服务依赖的是后一种模式。
+
+#### Syscall小结
+
+系统调用处理的核心不是“怎么发起 syscall 指令”，而是调度状态管理：
+
+```text
+进入前：
+  保存 syscall 栈信息
+  禁止栈在危险窗口增长
+  把 G 标成 _Gsyscall
+  让 sysmon 有机会 retake P
+
+返回后：
+  重新获取 P
+  清理 syscallsp
+  把 G 接回正常调度
+
+阻塞过久：
+  sysmon 不打断 syscall
+  只抢回 P 给其他 M 用
+```
+
 ### 23 Signal处理
+
+信号是操作系统异步打进进程或线程的一种机制。对 Go runtime 来说，signal 同时服务几类完全不同的需求：
+
+```text
+用户信号：
+  os/signal.Notify 接收 SIGINT、SIGTERM、SIGHUP 等
+
+同步异常：
+  SIGSEGV、SIGBUS、SIGFPE 等可能转换成 panic
+
+运行时控制：
+  SIGURG 用于异步抢占
+  SIGPROF 用于 CPU profiling
+
+cgo 协作：
+  Go handler 和 C handler 之间需要转发与共存
+```
+
+这使得 Go 的 signal 处理比“注册一个 handler”复杂得多。
+
+#### sigtable
+
+Unix 平台上，runtime 用 `sigtable` 描述每个信号的默认策略。每个条目包含 flags 和名字。
+
+常见 flag：
+
+```text
+_SigNotify
+  可以交给 os/signal.Notify
+
+_SigKill
+  如果没有被 Notify 接管，安静退出
+
+_SigThrow
+  如果没有被 Notify 接管，打印 traceback 后退出
+
+_SigPanic
+  如果是内核触发的同步异常，转成 panic
+
+_SigDefault
+  默认不主动安装 Go handler
+
+_SigUnblock
+  不应该被信号 mask 长期阻塞
+
+_SigSetStack
+  不替换 handler，但确保原 handler 使用 signal stack
+```
+
+例如在 Linux 上：
+
+```text
+SIGINT   _SigNotify + _SigKill
+SIGQUIT  _SigNotify + _SigThrow
+SIGSEGV  _SigPanic  + _SigUnblock
+SIGPROF  _SigNotify + _SigUnblock
+SIGCHLD  _SigNotify + _SigUnblock + _SigIgn
+SIGURG   _SigNotify + _SigIgn
+```
+
+同一个信号可能有多个身份。`SIGURG` 既可能被应用使用，也被 Go runtime 选作异步抢占信号；所以 handler 里即使处理了抢占，也可能继续让它走用户信号路径。
+
+#### 初始化信号处理
+
+启动时，runtime 会调用 `initsig`：
+
+```text
+initsig
+  |
+  +-- 遍历 sigtable
+  |
+  +-- 保存已有 handler 到 fwdSig
+  |
+  +-- 判断是否安装 Go handler
+  |
+  +-- 设置 signal stack
+  |
+  +-- setsig(sig, sighandler)
+```
+
+`fwdSig` 很重要。Go 进程可能不是一个纯 Go 程序：
+
+```text
+Go 程序里链接了 C 库
+C 代码先安装了自己的 signal handler
+Go 被编译成 c-shared / c-archive 嵌入 C 主程序
+```
+
+runtime 不能简单覆盖所有 handler。它要保存旧 handler，并在某些场景把信号转发回去。
+
+#### signal handler的限制
+
+信号 handler 可以在几乎任意时刻打断当前线程：
+
+```text
+可能正持有锁
+可能正在分配内存
+可能处于 STW
+可能在 C 代码里
+可能没有完整的 Go G/M/P 上下文
+```
+
+因此 handler 里有严格限制：
+
+```text
+不能阻塞
+不能随便加锁
+不能分配内存
+不能触发写屏障
+不能依赖普通 goroutine 调度
+```
+
+Go 的 handler 通常运行在每个 M 的 `gsignal` 栈上，而不是用户 goroutine 栈上。这样同步异常或抢占信号打进来时，不会继续消耗可能已经出问题的用户栈。
+
+这也是 runtime 里 signal 相关函数常见 `nosplit`、`nowritebarrierrec` 的原因。
+
+#### sighandler分发路径
+
+Unix 上信号进入 Go 后，大致会到 `sigtrampgo`，再进入 `sighandler`。核心分发可以简化成：
+
+```text
+sighandler(sig, info, ctxt, gp)
+  |
+  +-- SIGPROF:
+  |     采样当前 PC/SP，交给 CPU profiler
+  |
+  +-- sigPreempt(SIGURG):
+  |     尝试 doSigPreempt，实现异步抢占
+  |
+  +-- _SigPanic 且来自内核:
+  |     修改现场，让当前 G 看起来调用了 sigpanic
+  |
+  +-- _SigNotify 或用户发来的信号:
+  |     sigsend，交给 os/signal
+  |
+  +-- _SigKill:
+  |     dieFromSignal
+  |
+  +-- _SigThrow / 未恢复的 panic 信号:
+        打印 traceback，退出或 crash
+```
+
+同步异常转 panic 是最精妙的一条路径。
+
+比如 Go 代码里空指针解引用触发 `SIGSEGV`：
+
+```text
+CPU 触发 fault
+  |
+  v
+内核投递 SIGSEGV
+  |
+  v
+Go sighandler 发现这是 _SigPanic，且发生在当前用户 G 上
+  |
+  v
+记录 gp.sig/gp.sigcode/gp.sigpc
+  |
+  v
+调整寄存器和栈，让执行流转到 sigpanic
+  |
+  v
+Go 层看到 panic，可被 recover
+```
+
+如果同样的 `SIGSEGV` 发生在 runtime 内部、g0 栈、C 代码或不能安全增长栈的位置，runtime 就不会伪装成 panic，而是直接 throw/crash。
+
+#### os/signal如何收到信号
+
+`os/signal.Notify` 背后不是 handler 直接往用户 channel 里发送。handler 不能做这种复杂操作。
+
+runtime 用一个很小的队列结构 `sig` 做桥接：
+
+```text
+signal_enable
+  |
+  +-- 标记 sig.wanted
+  +-- sigenable 安装/启用 handler
+
+sighandler
+  |
+  +-- sigsend(sig)
+        |
+        +-- 设置 bitmask
+        +-- 唤醒等待 signal_recv 的 goroutine
+
+os/signal goroutine
+  |
+  +-- signal_recv()
+  +-- 从 bitmask 取出信号编号
+  +-- 再分发到用户 channel
+```
+
+这个队列按 bit 记录信号，所以相同信号可能合并：
+
+```text
+短时间收到多个 SIGTERM
+  |
+  v
+runtime 只保证“SIGTERM 已经待处理”
+  |
+  v
+不保证每一次投递都变成一次 channel send
+```
+
+这和 Unix 普通信号本身的语义是一致的。需要严格计数的场景，不能依赖普通 signal channel。
+
+#### 异步抢占信号
+
+Go 1.14 之后引入异步抢占。Unix 上 runtime 选择 `SIGURG` 作为抢占信号。
+
+简化流程：
+
+```text
+sysmon 发现某个 G 运行太久
+  |
+  v
+preemptM(mp)
+  |
+  v
+向目标 M 发送 sigPreempt(SIGURG)
+  |
+  v
+sighandler 中 doSigPreempt
+  |
+  v
+如果当前位置可安全抢占，修改执行现场进入 asyncPreempt
+  |
+  v
+G 让出执行权
+```
+
+抢占信号不是任意位置都能成功。runtime 仍要判断当前 PC 是否在安全点、是否在 runtime 关键区、是否允许扫描栈。失败时会等待下一次机会。
+
+这也解释了 `GODEBUG=asyncpreemptoff=1` 能关闭异步抢占：它不是关闭信号系统，而是让这条抢占路径不生效。
+
+#### SIGPROF和CPU Profiling
+
+CPU profiler 通常依赖 `SIGPROF`。信号到达时，handler 采集当前线程的执行位置：
+
+```text
+SIGPROF
+  |
+  v
+sighandler
+  |
+  v
+sigprof(pc, sp, lr, gp, mp)
+  |
+  v
+记录采样栈
+```
+
+如果信号打在 Go 代码上，runtime 可以按 Go 的栈元数据展开调用栈。如果打在非 Go 线程或 C 代码上，就要走 cgo traceback 相关机制，精度和可用信息取决于平台、编译选项和 C 侧支持。
+
+#### cgo下的信号转发
+
+cgo 让 signal 处理更复杂，因为进程里可能同时存在 Go handler 和 C handler。
+
+runtime 的原则大致是：
+
+```text
+信号发生在 Go 代码中，且 Go 需要处理
+  -> Go handler 处理
+
+信号发生在 C 代码或非 Go 线程中，且 C 侧有 handler
+  -> 转发给原 handler
+
+Go 不处理该信号，且原来有 handler
+  -> 转发
+
+Go 不处理该信号，也没有可转发 handler
+  -> 按默认行为退出或 crash
+```
+
+`sigfwdgo` 会检查：
+
+```text
+当前 signal 是否由 Go 接管
+原 handler 是什么
+信号是否来自用户
+是否为同步异常
+当前线程是否在 Go G 上
+当前 M 是否处于 incgo
+```
+
+这就是为什么某些 C 库自己安装 signal handler 后，和 Go 程序混用时会出现微妙行为。两边都想处理信号，runtime 必须根据发生位置和信号类型做取舍。
+
+#### Signal小结
+
+Go 的 signal 系统本质上是一个异步边界管理器：
+
+```text
+对用户：
+  提供 os/signal.Notify
+
+对语言：
+  把部分同步 fault 转成 panic/recover 机制
+
+对调度器：
+  支撑异步抢占
+
+对诊断：
+  支撑 CPU profiling 和崩溃 traceback
+
+对 cgo：
+  和 C handler、非 Go 线程、signal mask 共存
+```
+
+它的难点不在于 `sigaction` 本身，而在于 handler 必须在极端受限的上下文里，安全地把事件转交给 Go runtime。
+
 ### 24 cgo与线程管理
+
+cgo 是 Go runtime 和外部 C 世界之间最复杂的边界之一。原因不是调用 C 函数的语法复杂，而是 Go 和 C 对执行环境的假设不同：
+
+```text
+Go:
+  goroutine 栈可增长
+  goroutine 可在不同 M 之间迁移
+  GC 需要知道指针在哪里
+  GOMAXPROCS 限制同时执行 Go 代码的 P 数量
+
+C:
+  运行在固定 OS 线程栈上
+  依赖 ABI、TLS、errno、signal mask
+  可能长时间阻塞
+  可能回调 Go
+  可能创建自己的线程
+```
+
+runtime 要做的事，就是让这两个世界在边界上互相可见，但又不破坏各自的规则。
+
+#### Go调用C
+
+cgo 生成的 Go wrapper 最终会调用 `runtime.cgocall`。简化流程：
+
+```text
+Go function
+  |
+  v
+cgo 生成的 wrapper
+  |
+  v
+runtime.cgocall(_cgo_Cfunc_f, frame)
+  |
+  +-- entersyscall
+  |
+  +-- 标记 mp.incgo = true，mp.ncgo++
+  |
+  +-- asmcgocall 切到 m.g0 栈
+  |
+  +-- 执行 gcc 编译出的 _cgo_Cfunc_f
+  |
+  +-- C 函数返回
+  |
+  +-- mp.incgo = false，mp.ncgo--
+  |
+  +-- exitsyscall
+  |
+  v
+回到 Go
+```
+
+这里有两个关键动作。
+
+第一，`cgocall` 会调用 `entersyscall`：
+
+```text
+C 代码可能阻塞很久
+  |
+  v
+不能让它占住 P
+  |
+  v
+告诉调度器：当前 G 暂时离开 Go 执行世界
+```
+
+所以长时间运行的 C 函数不会直接消耗 `GOMAXPROCS` 中的 P。它会占用一个 OS 线程，但 P 可以被其他 M 拿去执行 Go goroutine。
+
+第二，`asmcgocall` 会切到 `m.g0` 栈：
+
+```text
+用户 goroutine 栈：
+  Go runtime 管理，可增长，可移动
+
+m.g0 栈：
+  OS 线程栈/系统栈，适合运行 C ABI 代码
+```
+
+C 编译器不知道 Go goroutine 栈的增长规则，也不会配合 Go 的栈检查。因此进入 C 前要切到 C 能理解的线程栈。
+
+#### 为什么cgo像syscall但不完全一样
+
+cgo 调用和 syscall 都会让当前 G 进入“离开 Go 执行”的状态：
+
+```text
+syscall:
+  Go -> kernel -> Go
+
+cgo:
+  Go -> C -> Go
+```
+
+相似点：
+
+```text
+都可能阻塞 M
+都要让 P 可被其他 M 使用
+都要保存 Go 栈信息给 GC/traceback
+都要在返回时 exitsyscall 重新拿 P
+```
+
+不同点：
+
+```text
+syscall 进入内核，通常不会主动回调 Go
+cgo 进入 C，C 代码可能在中途回调 Go
+
+syscall 的 ABI 是内核约定
+cgo 要在 gcc ABI 和 gc ABI 之间切换
+
+syscall 的阻塞通常由内核控制
+cgo 中 C 代码可以持有锁、创建线程、安装 signal handler
+```
+
+所以 `cgocall.go` 里大量复杂度都来自“C 调 Go”的回调路径。
+
+#### C回调Go
+
+C 代码回调 Go 时，路径大致是：
+
+```text
+C function
+  |
+  v
+cgo 生成的 GoF（gcc ABI）
+  |
+  v
+crosscall2
+  |
+  v
+runtime.cgocallback
+  |
+  v
+runtime.cgocallbackg
+  |
+  v
+_cgoexp_GoF(frame)
+  |
+  v
+真正的 Go 函数
+```
+
+`crosscall2` 是 ABI 适配层：C 编译器按 gcc ABI 调它，它再按 Go ABI 进入 runtime。
+
+进入 `cgocallbackg` 后，runtime 要做一件看起来反直觉的事：
+
+```text
+exitsyscall()
+```
+
+原因是当前线程原本处在一次 `cgocall` 中，已经被 runtime 视为“在 syscall/C 世界里”。现在 C 要回调 Go，就必须重新获得运行 Go 代码的资格：
+
+```text
+拿到 P
+切回可运行的 Go G
+允许分配、调度、栈增长、执行 defer/panic
+```
+
+回调结束、准备回到 C 时，再做相反动作：
+
+```text
+reentersyscall(savedpc, savedsp, savedbp)
+```
+
+也就是重新进入“外部 C 调用还没结束”的状态。
+
+#### 非Go线程回调Go
+
+更麻烦的是：C 可以创建自己的线程，然后从这个线程调用 Go 导出的函数。
+
+这个线程不是 Go 创建的，刚进入 Go runtime 时可能没有：
+
+```text
+没有 M
+没有 g0
+没有 TLS 中的 g
+没有 Go signal stack
+没有 P
+```
+
+runtime 用 `needm` 解决这个问题：
+
+```text
+非 Go 线程调用 Go
+  |
+  v
+needm
+  |
+  +-- 从 extra M 列表取一个 M
+  +-- 绑定当前线程的 TLS
+  +-- 设置 g = m.g0
+  +-- 根据当前线程栈刷新 g0 栈边界
+  +-- 初始化 signal stack / signal mask
+  +-- 准备一个 extra goroutine 作为回调执行上下文
+  |
+  v
+进入 cgocallbackg
+  |
+  v
+exitsyscall 获取 P 后执行 Go
+```
+
+回调完成后，如果这个 M 是临时借给非 Go 线程的，会通过 `dropm` 放回 extra M 列表：
+
+```text
+dropm
+  |
+  +-- 把 extra G 标回 _Gdeadextra
+  +-- 清理 trace 状态
+  +-- unminit，撤销当前线程上的 Go 运行时初始化
+  +-- setg(nil)
+  +-- 清空 g0 栈边界
+  +-- putExtraM
+  +-- 恢复原 signal mask
+```
+
+runtime 维护 extra M 的不变量：需要时总能拿到一个可用 M。如果取走了最后一个，稍后会补充新的 extra M。
+
+#### 线程创建
+
+普通 Go 调度创建 M 时，runtime 可以直接调用系统线程创建接口。但启用 cgo 后，线程创建可能要经由 C 运行库：
+
+```text
+iscgo && _cgo_thread_start != nil
+  |
+  v
+通过 _cgo_thread_start 创建线程
+```
+
+这样做是为了让 C 运行库有机会正确初始化线程本地状态、TLS、signal mask 等。特别是在使用 pthread、libc、Sanitizer 或平台特定线程机制时，绕过 C 运行库可能出问题。
+
+所以 cgo 不只是“能链接 C 函数”，它会改变 runtime 创建和管理 OS 线程的方式。
+
+#### LockOSThread与cgo
+
+Go goroutine 默认不绑定 OS 线程。调度器可以在不同 M 上继续执行同一个 G。
+
+但很多 C API 依赖线程局部状态：
+
+```text
+OpenGL / GUI 主线程
+某些数据库或加密库的 thread local state
+必须成对调用的 C init/fini
+依赖 errno 或 TLS 的上下文
+```
+
+这时需要 `runtime.LockOSThread`：
+
+```text
+LockOSThread
+  |
+  v
+当前 G 绑定当前 M
+  |
+  v
+调度器不会把这个 G 移到别的 M 上运行
+```
+
+cgo 回调路径里也会临时锁线程。因为 C 回调进入 Go 后，返回时还必须回到同一个 C 调用栈和同一个 OS 线程；中途如果被调度到别的 M，C 栈就断了。
+
+不过 `LockOSThread` 不是免费的。锁住线程的 goroutine 阻塞时，runtime 需要额外处理 locked M/G，线程复用能力会下降。只有确实有线程亲和性要求时才应该使用。
+
+#### cgo与GC指针规则
+
+Go GC 只理解 Go 堆、Go 栈和 runtime 登记过的根。C 内存和 C 全局变量对 GC 来说基本是黑盒。
+
+因此，Go 指针传给 C 必须受限制：
+
+```text
+C 不能长期保存普通 Go 指针
+C 不能保存指向包含 Go 指针的 Go 对象的指针
+C 返回后，临时传入的 Go 指针必须不再被 C 使用
+需要跨调用保存时，必须使用明确的 pin 或句柄机制
+```
+
+runtime 和 cgo 生成代码会插入检查，例如 `cgoCheckPointer`：
+
+```text
+Go 调 C 前
+  |
+  v
+检查参数中是否含有不允许传给 C 的 Go 指针
+  |
+  +-- 允许：调用 C
+  |
+  +-- 不允许：panic
+```
+
+这些规则的目的不是“为难 cgo”，而是保护 GC：
+
+```text
+如果 C 持有 Go 指针而 GC 不知道
+  |
+  +-- 对象可能被错误回收
+  +-- 栈对象可能在栈增长后地址变化
+  +-- 指针关系可能绕过写屏障
+```
+
+Go 当前堆对象不移动，这降低了一些复杂度，但不能取消指针规则。栈会增长和复制，GC 也需要准确知道哪些对象仍然可达。
+
+实际工程里常见做法是：
+
+```text
+传 C malloc 出来的内存给 C
+用 uintptr handle 间接引用 Go 对象
+用 runtime/cgo.Handle 管理 Go 值句柄
+必要时用 runtime.Pinner 显式 pin
+跨边界后用 runtime.KeepAlive 保证 Go 对象活到调用结束
+```
+
+#### cgo对调度和性能的影响
+
+cgo 有几个常见成本：
+
+```text
+边界切换成本：
+  cgocall、entersyscall、asmcgocall、exitsyscall 都不是零成本
+
+线程成本：
+  C 调用阻塞时占住 OS 线程，runtime 可能创建更多 M
+
+并行度成本：
+  C 代码运行时不占 P，但仍消耗 CPU，可能超过 GOMAXPROCS 的控制范围
+
+GC协作成本：
+  指针检查、KeepAlive、栈和 traceback 处理更复杂
+
+可观测性成本：
+  pprof/trace 对 C 栈的可见性依赖额外支持
+```
+
+因此高频小函数跨 cgo 边界通常不划算。更好的方式是：
+
+```text
+批量调用，减少边界次数
+让 C 函数做足够大的工作单元
+避免在热路径频繁 C -> Go callback
+明确线程亲和性，少用全局 TLS 状态
+用 pprof/trace 验证，而不是假设 cgo 成本可以忽略
+```
+
+#### cgo与信号
+
+cgo 程序里，信号处理还要考虑 C 世界：
+
+```text
+C 可能安装自己的 handler
+C 线程可能收到信号
+SIGPROF 可能打在 C 代码上
+同步异常可能发生在 Go 代码，也可能发生在 C 代码
+```
+
+runtime 保存旧 handler 到 `fwdSig`，并在 `sigfwdgo` 中判断是否转发。对于发生在 C 代码或非 Go 线程上的信号，Go 通常不能直接按 Go 栈规则处理，只能转发或按崩溃路径处理。
+
+这也是 cgo 程序的崩溃栈有时比纯 Go 程序更难读的原因：同一个进程里混合了 Go 栈、g0 栈、C 栈、signal 栈和回调栈。
+
+#### cgo小结
+
+cgo 的核心可以概括为四个切换：
+
+```text
+调度状态切换：
+  Go 执行 <-> syscall/C 执行
+
+栈切换：
+  goroutine stack <-> g0/system stack
+
+ABI切换：
+  gc ABI <-> gcc ABI
+
+线程归属切换：
+  Go-created thread <-> C-created thread
+```
+
+只要记住这四个切换，`cgocall`、`cgocallback`、`needm`、`dropm`、`LockOSThread` 就能串起来。
+
+#### Part 5问答速览
+
+问题一：为什么 Go 网络 I/O 不需要一个连接一个线程？
+
+```text
+Go 把 socket 设置成非阻塞。读写遇到 EAGAIN 时，goroutine 挂到 runtime 的 pollDesc 上并 park，少量 M 进入 epoll/kqueue/IOCP 等后端等待事件。fd ready 后，runtime 把对应 goroutine 放回可运行队列。
+```
+
+问题二：pollDesc里的 rg/wg 是什么？
+
+```text
+它们分别是读方向和写方向的等待槽，状态可以是 pdNil、pdWait、pdReady 或某个 G 指针。runtime 用 CAS 在这些状态间切换，避免 goroutine park 和 OS ready 事件并发时丢通知。
+```
+
+问题三：SetDeadline 是内核超时吗？
+
+```text
+通常不是。Go 在 pollDesc 中记录读写 deadline，并用 runtime timer 到期后唤醒等待中的 goroutine。唤醒后 pollWait 返回 timeout 错误。
+```
+
+问题四：goroutine 进入 syscall 后，P 会立刻释放吗？
+
+```text
+普通 entersyscall 不一定立刻释放 P。短 syscall 可以快速返回并继续使用原 P。若 syscall 阻塞较久，sysmon 会 retake 这个 P，把它交给其他 M。entersyscallblock 则会更主动地释放 P。
+```
+
+问题五：SIGSEGV 为什么有时是 panic，有时直接崩溃？
+
+```text
+如果 SIGSEGV 是 Go 用户代码中的同步 fault，且发生在当前用户 G 的安全上下文中，runtime 可以修改执行现场进入 sigpanic，从而变成可 recover 的 panic。如果发生在 runtime、g0、C 代码或不安全位置，就只能 throw/crash。
+```
+
+问题六：os/signal.Notify 会收到每一次信号吗？
+
+```text
+不保证。runtime 的信号队列按 bitmask 记录待处理信号，相同信号可能合并。普通 Unix signal 本身也不是可靠计数队列。
+```
+
+问题七：cgo 调用 C 时为什么要 entersyscall？
+
+```text
+C 函数可能长时间阻塞或运行外部代码。进入 C 前 runtime 把当前 G 标成 syscall 状态，让 P 可以被其他 M 使用；返回 Go 前再 exitsyscall 重新获取 P。
+```
+
+问题八：C 线程回调 Go 时为什么需要 needm？
+
+```text
+C 创建的线程没有 Go runtime 所需的 M、g0、TLS、signal stack 等上下文。needm 会从 extra M 列表借一个 M 绑定到当前线程，让这个线程能安全进入 Go；回调结束后 dropm 再清理并归还。
+```
 
 ## Part 6 语言特性底层实现
 
