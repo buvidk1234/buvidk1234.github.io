@@ -1,6 +1,6 @@
 baseURL = 'http://example.org/'
 languageCode = 'zh-cn'
-title = '我的技术博客'
+title = "buvidk's Blog"
 theme = 'PaperMod'
 
 [params]
@@ -8,8 +8,8 @@ theme = 'PaperMod'
     math = true
 
     [params.homeInfoParams]
-        Title = '我的技术博客'
-        Content = '欢迎交流。'
+        Title = "buvidk's Blog"
+        Content = "You don't need to be a great artist to be great at art."
 
     [[params.socialIcons]]
         name = 'github'
