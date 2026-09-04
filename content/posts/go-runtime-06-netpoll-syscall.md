@@ -7,6 +7,8 @@ tags = ['Go', 'Runtime', 'Netpoll', 'Syscall']
 
 > 本文源码基线为 **Go 1.26.2、Linux/amd64**。尤其注意：Go 1.26.2 已不再使用历史上的 `_Psyscall` 状态；旧文章基于 `_Psyscall` 描述的状态机不能直接套用到当前源码。
 
+在 trace 中，同样一段看起来像“等待 `Read` 返回”的代码，可能显示为 G 的 `Network wait`，也可能伴随 OS 线程增加。区别不在 Go 调用语法，而在底层 fd 能否由 runtime poller 以非阻塞方式管理。
+
 网络等待和阻塞系统调用都会让当前 goroutine 暂时无法继续，但 runtime 的处理方式不同：
 
 ```text
@@ -17,9 +19,11 @@ tags = ['Go', 'Runtime', 'Netpoll', 'Syscall']
   M 等在内核中，runtime 设法把 P 交给其他 M
 ```
 
-理解这一区别，就能解释 Go 为什么能用同步风格编写高并发网络服务，以及为什么某些 syscall 仍会增加线程数量。
+本文沿这两个可观察结果各追踪一次：可轮询网络 I/O 只 park G，真正阻塞的 syscall 则让 M 停在内核，并促使 runtime 把 P 交给其他 M。理解这一区别，就能解释 Go 为什么能用同步风格编写高并发网络服务，以及为什么某些 syscall 仍会增加线程数量。
 
-## 从net.Conn.Read到runtime
+## 可轮询网络I/O：只停下G
+
+### 从net.Conn.Read到runtime
 
 以 Unix 上 TCP 读取为例，调用链可简化为：
 
@@ -50,7 +54,7 @@ G 调用 Read
 
 fd 就绪只表示再次尝试可能有进展，并不保证应用需要的全部数据已经到达，因此标准库仍需处理短读和再次等待。
 
-## pollDesc是什么
+### pollDesc的生命周期与唤醒协议
 
 标准库的 `internal/poll.FD` 与 runtime 的 [`pollDesc`](https://github.com/golang/go/blob/go1.26.2/src/runtime/netpoll.go#L75) 共同维护 fd 的等待状态。关键字段包括：
 
@@ -74,7 +78,7 @@ pdReady  ready 已发生，等待者尚未消费
 G pointer 方向上已有实际等待的 G
 ```
 
-这套握手防止“检查完未就绪、但还没真正睡下时事件到达”导致丢失唤醒。
+这套握手防止“检查完未就绪、但还没真正睡下时事件到达”导致丢失唤醒。标准库创建网络 fd 后，会通过 runtime poll API 初始化 pollDesc，并让平台后端关注这个 fd。
 
 [`netpollblock`](https://github.com/golang/go/blob/go1.26.2/src/runtime/netpoll.go#L548) 的 CAS 协议是关键：
 
@@ -89,19 +93,9 @@ G pointer 方向上已有实际等待的 G
 
 ready 方的 `netpollunblock` 可能看到 `pdWait`、G 指针或 `pdNil`。看到 `pdWait` 时留下 `pdReady`，让尚未完成 park 的一方自行消费；看到 G 指针时取出 G；这就是事件先到和 park 先完成两种时序能够汇合的原因。
 
-## 打开、等待与关闭
+OS 返回 fd 事件后，`netpollready` 对相应方向执行同一状态转换：若 G 已经挂起，就从 `rg/wg` 取出它并加入待运行 G 列表；若事件早于 park 提交，则留下 `pdReady`。poller 的调用方随后把这批 G 注入调度器，`netpollready` 本身并不让某个 OS 线程直接从用户代码处继续执行。
 
-### 打开
-
-标准库创建网络 fd 后，通过 runtime poll API 初始化 pollDesc，并让平台后端关注这个 fd。epoll/kqueue 通常采用适合 runtime 唤醒模型的事件模式；Windows 则走 IOCP 的完成通知模型。
-
-### 等待
-
-等待路径先检查错误、关闭和 deadline，再尝试把当前 G 登记到读或写槽，最后通过 `gopark` 让出执行权。若 ready 在 park 前到达，状态机会让当前 G 消费 `pdReady` 而不真正睡眠。
-
-### 关闭
-
-关闭 fd 时必须：
+关闭 fd 时，runtime 必须：
 
 - 标记 pollDesc 已关闭。
 - 让现有读写等待者返回关闭错误。
@@ -110,7 +104,7 @@ ready 方的 `netpollunblock` 可能看到 `pdWait`、G 指针或 `pdNil`。看�
 
 Unix fd 数字会被快速复用，因此仅比较 fd 不够；序列号或等价代际信息是正确性的一部分。
 
-## 平台后端
+### 平台后端
 
 平台无关层定义等待语义，平台后端负责把 OS 事件转换为读写 ready：
 
@@ -122,7 +116,7 @@ Unix fd 数字会被快速复用，因此仅比较 fd 不够；序列号或等�
 
 后端返回的不是“直接恢复执行的线程”，而是一批已变为 runnable 的 G。它们还需要进入 Go 调度器，绑定 M/P 后才能继续执行。
 
-## Linux epoll后端的具体协议
+### Linux epoll后端的具体协议
 
 [`netpollinit`](https://github.com/golang/go/blob/go1.26.2/src/runtime/netpoll_epoll.go#L21) 创建 epoll fd 和非阻塞 eventfd，并把 eventfd 注册到 epoll。`netpollBreak` 向 eventfd 写入 1，用来打断正在 `epoll_wait` 的 M；`netpollWakeSig` 合并重复唤醒，避免每次 Timer/调度变化都累积一次 write。
 
@@ -138,23 +132,7 @@ eventfd EPOLLIN        -> poller被runtime显式唤醒
 
 普通 fd 事件只有在 event 中的 tag 与 `pd.fdseq` 仍一致时才调用 `netpollready`。这一步挡住 fd/pollDesc 已关闭复用后仍滞留在旧 `epoll_wait` 结果中的事件。
 
-## netpollready如何唤醒G
-
-OS 返回 fd 事件后，runtime 根据读写标志找到 pollDesc，并对相应方向执行 ready 状态转换：
-
-```text
-OS event
-  -> netpoll
-  -> netpollready(pd, mode)
-  -> 从 rg/wg 取出等待 G，或留下 pdReady
-  -> 形成 runnable G 列表
-  -> injectglist / ready
-  -> 调度器选择执行
-```
-
-如果事件早于 G 完成 park，runtime 会留下 `pdReady`；如果 G 已经挂起，就取出 G。两种时序最终都不会漏通知。
-
-## 调度器何时调用netpoll
+### 调度器何时调用netpoll
 
 netpoll 与调度器不是两个独立循环。常见接入点包括：
 
@@ -165,7 +143,7 @@ netpoll 与调度器不是两个独立循环。常见接入点包括：
 
 runtime 会避免大量 M 同时阻塞在 poller 中。一般由少量线程等待 OS 事件，其余无工作线程休眠。
 
-## Deadline为什么通常不是socket超时
+### Deadline为什么通常不是socket超时
 
 `SetReadDeadline`/`SetWriteDeadline` 通常通过 runtime timer 实现：
 
@@ -181,7 +159,7 @@ SetDeadline(t)
 
 序列信息用于让旧 timer 失效。例如先设置 deadline，随后又更新或取消；旧 timer 即使晚到，也不能唤醒新一代等待。
 
-## close、ready与deadline的三方竞态
+### close、ready与deadline的三方竞态
 
 `pollDesc` 用三层代次/摘要保护不同来源的旧事件：
 
@@ -195,7 +173,9 @@ SetDeadline(t)
 
 close 与 IO ready 对 `rg/wg` 的目标值不同：IO ready 在无人等待时留下 `pdReady`，供未来一次 Wait 消费；close/deadline 在无人等待时保持 `pdNil`，因为未来 Wait 会从 `atomicInfo` 得到持久错误。这样不会把一次旧超时伪装成新连接的一次 IO ready。
 
-## 普通Syscall路径
+## 阻塞系统调用：M也会停下
+
+### 普通Syscall路径
 
 普通系统调用的调度协作可以概括为：
 
@@ -210,7 +190,7 @@ Go code
 
 `entersyscall`/`exitsyscall` 不是替内核执行调用，而是维护 G/M/P 状态，让调度器和 GC 知道当前线程发生了什么。以下描述针对 Go 1.26.2；Go 1.25 及更早版本使用的 `_Psyscall` 状态图属于上一代实现，不能与本节混用。
 
-## entersyscall做什么
+### entersyscall做什么
 
 [`entersyscall`](https://github.com/golang/go/blob/go1.26.2/src/runtime/proc.go#L4737) 取得调用者 PC/SP/BP 后进入 `reentersyscall`：
 
@@ -228,7 +208,7 @@ Go code
 
 保存 PC/SP 不仅用于调度，也用于 GC 和 traceback。系统调用参数可能通过 `uintptr` 指向 Go 栈；内核仍在使用旧地址时移动栈会破坏指针，因此这条路径对栈增长有特殊限制。
 
-## Go 1.26如何表示“P在syscall中”
+### Go 1.26如何表示“P在syscall中”
 
 Go 1.26.2 的 [`runtime2.go`](https://github.com/golang/go/blob/go1.26.2/src/runtime/runtime2.go#L126) 明确将 `_Psyscall_unused` 标为废弃状态。普通 `entersyscall` 把 G 改为 `_Gsyscall`，但 P 仍为 `_Prunning`，`M.p` 和 `P.m` 暂时保持连接。runtime 通过“P 关联 M，而 M 的当前 G 处于 `_Gsyscall`”识别这一情况。
 
@@ -254,7 +234,7 @@ Go 1.26.2 的 [`runtime2.go`](https://github.com/golang/go/blob/go1.26.2/src/run
 
 `sysmon` 的 retake 不会打断内核调用。它夺回的是 P 的 Go 执行资格，让其他 M 使用；原来的 M 仍要等待内核返回。
 
-## exitsyscall如何回来
+### exitsyscall如何回来
 
 [`exitsyscall`](https://github.com/golang/go/blob/go1.26.2/src/runtime/proc.go#L4883) 先乐观地把 G 改回 `_Grunning`。此时可能短暂出现 `_Grunning` 但没有 P，后续必须取得 P 或进入 `exitsyscallNoP`：
 
@@ -270,13 +250,13 @@ exitsyscall
 
 慢路径中，返回 syscall 的线程可能停下，G 以后由另一个 M/P 执行。这体现了 G 与 OS 线程默认没有固定绑定关系。
 
-## syscalltick与sysmon
+### syscalltick与sysmon
 
 P 的 `syscalltick` 和 `sysmontick.syscallwhen` 帮助 [`retake`](https://github.com/golang/go/blob/go1.26.2/src/runtime/proc.go#L6630) 判断 syscall 是否持续未变化。它先快速筛选 `_Prunning` P，再用 `setBlockOnExitSyscall` 确认关联 G 确实处于 syscall。若本地队列为空且还有 idle/spinning P，runtime 会给短 syscall 留出时间；超过条件后才 take 并 handoff。
 
 这一机制的目标不是让每个 syscall 都零成本，而是在快速调用的恢复成本和长阻塞时的并行能力之间折中。
 
-## RawSyscall为什么特殊
+### RawSyscall为什么特殊
 
 `RawSyscall` 不走完整的 `entersyscall`/`exitsyscall` 调度通知。它适用于底层且确定很快返回的场景。如果用它执行可能长期阻塞的调用：
 
@@ -286,7 +266,7 @@ P 的 `syscalltick` 和 `sysmontick.syscallwhen` 帮助 [`retake`](https://githu
 
 业务代码通常应该使用标准库或 `x/sys` 提供的适当封装，而不是根据“少两次 runtime 调用”自行改用 `RawSyscall`。
 
-## Netpoll与Syscall如何选择路径
+## 两条路径如何选择
 
 ```text
 网络 fd 可设置非阻塞且受 poller 支持
@@ -314,6 +294,8 @@ P 的 `syscalltick` 和 `sysmontick.syscallwhen` 帮助 [`retake`](https://githu
 
 ## 可复现实验
 
+用同一个测试程序保留一组可运行的 CPU goroutine，并分别让另一组 G 等待“延迟发送数据的 TCP peer”和一个明确会阻塞线程的 syscall。前者应在 trace 中表现为 `Network wait`，且等待期间原 M/P 可以继续运行；后者会让 M 留在内核，持续足够久后由 runtime 把 P 交给别的 M。再用 `strace -f` 对照 epoll 事件和实际阻塞调用：
+
 ```bash
 go test -run TestServer -trace=trace.out ./...
 go tool trace trace.out
@@ -329,7 +311,7 @@ trace 用于区分 G 的 `Network wait`、`Syscall` 和 runnable 延迟；`strac
 
 ## 系列导航
 
+- [系列目录](/posts/go-runtime/)
 - [上一篇：GC、写屏障与Pacer](/posts/go-runtime-05-gc/)
 - 当前：Go Runtime（六）：Netpoll与Syscall
 - [下一篇：Signal与cgo线程管理](/posts/go-runtime-07-signal-cgo/)
-- [原始长文](/posts/go-runtime/)

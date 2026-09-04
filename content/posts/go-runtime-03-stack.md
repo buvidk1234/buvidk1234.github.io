@@ -11,6 +11,31 @@ goroutine 能够以较低成本大量创建，一个重要原因是它不需要�
 
 本文只讨论 goroutine 栈的运行时管理。对象为什么逃逸到堆由编译器决定，堆对象如何分配放在[下一篇：内存分配器](/posts/go-runtime-04-allocator/)中。
 
+## 先观察：普通函数为什么调用morestack
+
+先写一个具有明确栈帧、且不会被内联的函数，保存为 `stackcheck.go`：
+
+```go
+package main
+
+//go:noinline
+func frame(x int) int {
+	var buf [256]byte
+	buf[0] = byte(x)
+	return int(buf[0])
+}
+
+func main() { println(frame(7)) }
+```
+
+关闭优化和内联，查看编译器生成的汇编：
+
+```bash
+go tool compile -S -N -l stackcheck.go
+```
+
+在 `main.frame` 开头可以看到 SP 与栈保护值的比较，以及失败后对 `runtime.morestack_noctxt` 的调用。一个普通函数为何需要在入口询问 runtime，又如何在栈被替换后重新执行？下面先建立三类栈和 G 的现场模型，再回到另一个实验观察整段活动栈的迁移。`-N -l` 只用于减少实验干扰，不代表生产构建一定生成相同指令。
+
 ## 三类栈不要混淆
 
 一个 M 至少关联三种执行上下文：
@@ -81,30 +106,7 @@ guard := g.stackguard0
 
 真正的生成规则位于编译器的 [`cmd/internal/obj/x86/obj6.go`](https://github.com/golang/go/blob/go1.26.2/src/cmd/internal/obj/x86/obj6.go)；保护区常量定义在 [`runtime/stack.go`](https://github.com/golang/go/blob/go1.26.2/src/runtime/stack.go)。分析汇编时必须同时看目标架构和函数帧大小。
 
-### 可复现实验
-
-创建 `stackcheck.go`：
-
-```go
-package main
-
-//go:noinline
-func frame(x int) int {
-	var buf [256]byte
-	buf[0] = byte(x)
-	return int(buf[0])
-}
-
-func main() { println(frame(7)) }
-```
-
-查看编译器输出：
-
-```bash
-go tool compile -S -N -l stackcheck.go
-```
-
-在 `main.frame` 开头可以观察 SP 与栈保护值的比较，以及失败后对 `runtime.morestack_noctxt` 的调用。`-N -l` 用于减少优化和内联干扰，不代表生产构建一定生成完全相同的指令。
+开篇实验看到的正是这套入口检查。它只暴露了失败后的第一跳；接下来还要解释 runtime 如何在不能继续依赖当前用户栈的情况下保存现场并完成搬迁。
 
 ## morestack如何切到g0
 
@@ -217,11 +219,11 @@ goroutine 活动栈是 GC 根。扫描器使用 PC 找到函数元数据和安�
 
 `//go:nosplit` 表示函数入口不执行普通栈检查。它用于 morestack 本身、信号 trampoline、调度切换等无法再次触发栈增长的路径。
 
-它不是“更快函数”的通用注解。链接器会分析静态 nosplit 调用链是否超出预留空间；函数若包含可能增长栈、分配或进入不受控调用的行为，使用 nosplit 会破坏 runtime 的安全假设。
+它不是“更快函数”的通用注解。链接器会分析静态 nosplit 调用链，确认最坏情况下的栈使用不超过预留空间；超出时链接失败。`NOSPLIT` 本身只承诺省略入口检查，并不笼统等于“函数不能分配、加锁或调用可分裂函数”。这些额外限制来自具体执行上下文：例如 signal handler、尚未取得 P 的路径或持有特定 runtime 锁的代码，可能确实不能分配、阻塞或触发写屏障，并由其他约束共同保证。
 
-## 如何验证栈增长
+## 回到实验：活动栈真的移动了吗
 
-可以在深递归前后读取同一个局部变量的地址，观察包含它的栈帧是否被整体迁移：
+开篇汇编说明函数会检查空间并进入 `morestack`；现在可以在深递归前后读取同一个局部变量的地址，观察这条路径是否真的迁移了包含它的活动栈帧：
 
 ```go
 package main
@@ -253,7 +255,7 @@ func observe() {
 func main() { observe() }
 ```
 
-这里把 `uintptr` 只当成数值打印，绝不在可能的栈增长后把 `before` 转回指针。若 `moved=true`，说明 `observe` 的活动栈帧在递归期间被复制；使用 `GODEBUG=gcshrinkstackoff=1` 还能隔离 GC 缩栈的影响。单次未移动不能证明栈不会增长，因为初始容量、编译后的帧大小和调用前已有栈空间都会影响结果。
+这里把 `uintptr` 只当成数值打印，绝不在可能的栈增长后把 `before` 转回指针。若 `moved=true`，说明 `observe` 的活动栈帧在递归期间被复制；入口检查、g0 上的搬迁和现场恢复共同解释了地址变化后函数仍能正常返回。使用 `GODEBUG=gcshrinkstackoff=1` 还能隔离 GC 缩栈的影响。单次未移动不能证明栈不会增长，因为初始容量、编译后的帧大小和调用前已有栈空间都会影响结果。
 
 ## 源码阅读顺序
 
@@ -277,7 +279,7 @@ func main() { observe() }
 
 ## 系列导航
 
+- [系列目录](/posts/go-runtime/)
 - [上一篇：GMP与Goroutine调度](/posts/go-runtime-02-scheduler/)
 - 当前：Go Runtime（三）：Goroutine栈管理
 - [下一篇：内存分配器](/posts/go-runtime-04-allocator/)
-- [原始长文](/posts/go-runtime/)

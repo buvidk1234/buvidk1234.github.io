@@ -5,11 +5,21 @@ title = 'Go Runtime（四）：内存分配器'
 tags = ['Go', 'Runtime', 'Memory']
 +++
 
-> 本文源码基线为 **Go 1.26.2、Linux/amd64**。文中的源码链接固定到 `go1.26.2` tag；对象大小阈值、size class 表和局部快路径可能随版本变化。
+> 本文源码基线为 **Go 1.26.2、Linux/amd64、默认 GOEXPERIMENT**。对象大小阈值、size class 表和局部快路径可能随版本变化。
+
+本文从两个现象出发：源码里的 `new(T)` 可能产生零次堆分配，对象失去引用后 RSS 也可能维持原值。第一个现象把我们带入 `mallocgc`、mcache、mcentral 和 mheap；第二个现象继续追踪 sweep、页分配器与 scavenger。
 
 Go 内存分配器要同时满足三类目标：小对象分配足够快，多 P 并发时减少共享锁竞争，GC 又能由任意堆地址快速定位对象边界和标记元数据。它采用按对象规格分级、按 P 缓存、按页统一管理的结构。
 
-对象是否进入这里首先由编译器逃逸分析决定；本文从已经确定需要堆分配的对象开始，追踪 `mallocgc` 到 mcache、mcentral、mheap 和页分配器。
+把这些现象对应到当前源码前，必须先分清实验开关：源码中存在字段或函数，不代表默认构建会执行它。
+
+| 实验（`GOEXPERIMENT`值） | Go 1.26.2默认值 | 本文中的影响 |
+| --- | --- | --- |
+| `GreenTeaGC`（`greenteagc`） | 启用 | 部分小对象 span 使用页内 mark/scan bits |
+| `SizeSpecializedMalloc`（`sizespecializedmalloc`） | 禁用 | 默认仍从通用 `mallocgc` 分派 |
+| `RuntimeFreegc`（`runtimefreegc`） | 禁用 | `mcache.reusableNoscan` 默认不参与分配 |
+
+默认值以 [`internal/buildcfg` 的实验 baseline](https://github.com/golang/go/blob/go1.26.2/src/internal/buildcfg/exp.go#L80) 为准；后文提到关闭的实验路径时会再次标明。
 
 ## 先确认对象是否真的进入堆
 
@@ -71,11 +81,11 @@ heapArena
 - 小对象 span 被切成固定大小的槽位。
 - 大对象通常独占一个或多个 span。
 
-固定规格降低了查找成本和外部碎片，但会产生向上取整的内部碎片。例如请求 24 字节时，实际槽位大小由当前 size class 表决定，可能大于 24 字节。
+固定规格降低了查找成本和外部碎片，但会产生向上取整的内部碎片。例如 Go 1.26.2 的 size class 表中 24 字节本身就是一个规格，而请求 25 字节会进入 32 字节规格；不能脱离当前版本的表猜测具体槽位大小。
 
 ## mallocgc主流程
 
-多数堆分配最终进入 [`mallocgc`](https://github.com/golang/go/blob/go1.26.2/src/runtime/malloc.go#L1119) 或编译器选择的特化入口。Go 1.26.2 的分派不能只写成传统三分支：
+默认构建中的堆分配最终进入 [`mallocgc`](https://github.com/golang/go/blob/go1.26.2/src/runtime/malloc.go#L1119)，再按大小和指针布局分派。Go 1.26.2 源码还包含 `SizeSpecializedMalloc` 实验路径，但默认 baseline 没有启用它；只有显式设置 `GOEXPERIMENT=sizespecializedmalloc` 且平台、sanitizer 等条件允许时，编译器选择的特化入口才会生效：
 
 ```text
 size == 0 -> &zerobase
@@ -95,7 +105,7 @@ size == 0 -> &zerobase
         -> 更新 sanitizer、profile、GC assist 和统计
 ```
 
-`sizeSpecializedMallocEnabled` 还受 GOEXPERIMENT、race/asan/msan、平台等条件影响，所以不能看到 Go 1.26 的源码后就断言所有生产构建都走专用表。无论分派入口如何，常见小对象最终仍依赖当前 P 的 mcache，避免每次分配争用全局堆锁。
+`sizeSpecializedMallocEnabled` 同时受 GOEXPERIMENT、race/asan/msan/Valgrind 和平台条件约束。特别是默认 Go 1.26.2 构建中它为 false，不能看到源码中的函数表就断言生产程序已经使用专用入口。无论分派入口如何，常见小对象最终仍依赖当前 P 的 mcache，避免每次分配争用全局堆锁。
 
 ## mcache与mcentral
 
@@ -122,7 +132,7 @@ type mcache struct {
 }
 ```
 
-`alloc` 是按 spanClass 索引的当前 span。`reusableNoscan` 是 Go 1.26 中值得单独注意的对象复用快路径；它与 span 中通过 allocation bitmap 查找新槽位不是同一机制。`flushGen` 用来判断跨 GC 周期后缓存是否过期，需要在重新获得 P 时刷新。
+`alloc` 是按 spanClass 索引的当前 span。结构体中虽然存在 `reusableNoscan`，但 `addReusableNoscan`、`hasReusableNoscan` 和取对象路径都会先检查 `runtimeFreegcEnabled`；默认构建中该实验关闭，所以这个对象复用列表不参与分配。只有显式启用 `GOEXPERIMENT=runtimefreegc` 时，它才成为区别于 allocation bitmap 新槽位查找的另一条路径。`flushGen` 用来判断跨 GC 周期后缓存是否过期，需要在重新获得 P 时刷新。
 
 [`mcentral`](https://github.com/golang/go/blob/go1.26.2/src/runtime/mcentral.go#L22) 不再适合画成一个简单链表：
 
@@ -134,7 +144,7 @@ type mcentral struct {
 }
 ```
 
-两组 `partial/full` 随 `sweepgen` 交换“已清扫”和“未清扫”角色。`cacheSpan` 会先扣除 proportional sweep credit，优先从未清扫集合取 span 并尝试 sweep，再查已清扫集合，最后向 mheap 申请新 span。
+两组 `partial/full` 随 `sweepgen` 交换“已清扫”和“未清扫”角色。`cacheSpan` 先扣除 proportional sweep credit，然后优先取已有空槽的 `partialSwept`；没有时再依次尝试并清扫 `partialUnswept` 与 `fullUnswept`，最后才向 mheap 申请新 span。未清扫路径有固定的 `spanBudget`，避免一次补货为了寻找空槽而清扫过多 span。
 
 ## mheap与heapArena
 
@@ -158,9 +168,13 @@ object address
 
 页分配器不是按页线性扫描整个堆。[`pageAlloc.alloc`](https://github.com/golang/go/blob/go1.26.2/src/runtime/mpagealloc.go#L879) 使用分层摘要定位足够长的空闲页区间；每个 P 的 `pageCache` 又缓存一小段页位图，降低单页 span 分配访问全局 pageAlloc 的频率。
 
-## allocBits、gcmarkBits与sweepgen
+## 分配与清扫如何交接span
 
-`allocBits` 记录 span 中哪些槽位已分配；`gcmarkBits` 记录本轮 GC 哪些对象被标记存活。清扫阶段根据两组信息判断对象是否可以回收，并为下一轮更新位图角色。
+`allocBits` 记录 span 中哪些槽位已经分配，是分配器寻找和发布对象的依据；GC 的 mark bits 则记录本轮仍然存活的对象。清扫必须在独占该 span 的前提下比较两者，回收未标记槽位，再把存活结果发布成下一轮分配状态。
+
+标记位的暂存位置取决于 GC 实现。Go 1.26.2 默认启用 Green Tea GC，部分小对象 span 在页内 `spanInlineMarkBits` 积累 mark/scan 状态，其他对象使用 `gcmarkBits`。清扫前半段仍通过统一的 mark-bit 访问器处理对象；在最终统计存活对象和轮换位图之前，才把需要的 inline marks 合并到 `gcmarkBits`。随后 `gcmarkBits` 成为新的 `allocBits`，runtime 再准备一组清零的标记位供下一轮 GC 使用。
+
+分配器关心的是这次所有权和位图交接；Green Tea 的 mark/scan 队列、并发标记过程及存活对象如何到达这些位图，放在[下一篇：GC、写屏障与Pacer](/posts/go-runtime-05-gc/)中展开。
 
 `sweepgen` 用代际计数表示 span 与当前清扫周期的关系，帮助多个 goroutine 并发或按需清扫时判断一个 span 是否已经处理，避免只用简单布尔值造成周期混淆。
 
@@ -170,7 +184,7 @@ object address
 freeindex / allocCache   下一次快速查找空闲槽位的位置和缓存
 nelems / elemsize       span 内对象数量与槽位大小
 allocBits               哪些槽位已分配
-gcmarkBits              本轮 GC 标记到哪些对象
+gcmarkBits/inline marks 本轮 GC 标记到哪些对象
 allocCount              当前已分配数量
 spanclass               size class + scan/noscan
 sweepgen                 与 mheap_.sweepgen 的相对关系
@@ -242,6 +256,7 @@ scavenger 有独立于 GC mark pacer 的 [`gcPaceScavenger`](https://github.com/
 | size class | [`internal/runtime/gc/sizeclasses.go`](https://github.com/golang/go/blob/go1.26.2/src/internal/runtime/gc/sizeclasses.go) |
 | 页分配 | [`runtime/mpagealloc.go`](https://github.com/golang/go/blob/go1.26.2/src/runtime/mpagealloc.go#L879) |
 | 物理页回收 | [`runtime/mgcscavenge.go`](https://github.com/golang/go/blob/go1.26.2/src/runtime/mgcscavenge.go) |
+| Green Tea标记位 | [`runtime/mgcmark_greenteagc.go`](https://github.com/golang/go/blob/go1.26.2/src/runtime/mgcmark_greenteagc.go) |
 | OS内存状态 | [`runtime/mem.go`](https://github.com/golang/go/blob/go1.26.2/src/runtime/mem.go#L49)、[`runtime/mem_linux.go`](https://github.com/golang/go/blob/go1.26.2/src/runtime/mem_linux.go#L21) |
 
 ## 观测与验证
@@ -262,7 +277,7 @@ go tool pprof -inuse_space mem.pprof
 
 ## 系列导航
 
+- [系列目录](/posts/go-runtime/)
 - [上一篇：Goroutine栈管理](/posts/go-runtime-03-stack/)
 - 当前：Go Runtime（四）：内存分配器
 - [下一篇：GC、写屏障与Pacer](/posts/go-runtime-05-gc/)
-- [原始长文](/posts/go-runtime/)

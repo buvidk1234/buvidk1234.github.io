@@ -11,6 +11,29 @@ tags = ['Go', 'Runtime', 'sync', 'Mutex']
 
 先建立边界：runtime semaphore 是“按地址等待与唤醒”的底层设施，不是公开的计数信号量类型。存放在 `uint32` 地址中的 token 只服务于防丢唤醒和交接协议。
 
+## 先锁定公开契约
+
+`Mutex.Unlock` 与之后的 `Lock`、`Once` 中 `f` 的完成与所有 `Do` 返回、`WaitGroup.Done` 与它解除的 `Wait` 都建立文档规定的 happens-before 关系。正确性应依赖这些公开保证，而不是当前源码中的 CAS 顺序、starvation 阈值或 treap 形状。
+
+同理，`TryLock` 失败不建立同步关系，`RWMutex` 不支持升级/降级，复制首次使用后的同步对象属于错误用法。源码分析应解释契约如何实现，而不是把私有机制升级为新契约。
+
+## 一次竞争如何穿过各层
+
+```text
+高层状态机
+  Mutex/RWMutex/WaitGroup/Cond/Once
+        |
+原子快路径与竞争判定
+        |
+runtime sema / notifyList
+        |
+sudog + goparkunlock / goready
+        |
+GMP scheduler
+```
+
+原子操作避免无竞争路径进入内核或调度器；runtime 队列解决竞争时的睡眠与唤醒；调度器决定被 ready 的 G 何时真正运行。Linux futex 不是这些普通路径的直接一一对应物：runtime 自己调度 G，只有 OS 线程级 runtime 锁和休眠等更底层场景才需要平台同步原语。
+
 ## 从sync包到runtime
 
 标准库通过无函数体声明和 `go:linkname` 连接 runtime：
@@ -166,29 +189,6 @@ if !o.done.Load() {
 
 若一开始 CAS 把 done 设为 true，其他调用会在 `f` 尚未完成时返回，破坏“所有 `Do` 返回都观察到初始化完成”的保证。`Store` 使用 defer，因此 `f` panic 时也视为已经执行过，后续 `Do` 不会重试。递归调用同一个 Once 会等待自己持有的 Mutex，因而死锁。
 
-## 原子操作、semaphore与调度器各管一层
-
-```text
-高层状态机
-  Mutex/RWMutex/WaitGroup/Cond/Once
-        |
-原子快路径与竞争判定
-        |
-runtime sema / notifyList
-        |
-sudog + goparkunlock / goready
-        |
-GMP scheduler
-```
-
-原子操作避免无竞争路径进入内核或调度器；runtime 队列解决竞争时的睡眠与唤醒；调度器决定被 ready 的 G 何时真正运行。Linux futex 不是这些普通路径的直接一一对应物：runtime 自己调度 G，只有 OS 线程级 runtime 锁和休眠等更底层场景才需要平台同步原语。
-
-## 内存模型不等于实现细节
-
-`Mutex.Unlock` 与之后的 `Lock`、`Once` 中 `f` 的完成与所有 `Do` 返回、`WaitGroup.Done` 与它解除的 `Wait` 都建立文档规定的 happens-before 关系。正确性应依赖这些公开保证，而不是当前源码中的 CAS 顺序、starvation 阈值或 treap 形状。
-
-同理，`TryLock` 失败不建立同步关系，`RWMutex` 不支持升级/降级，复制首次使用后的同步对象属于错误用法。源码分析应解释契约如何实现，而不是把私有机制升级为新契约。
-
 ## 源码阅读顺序
 
 1. [`semacquire1` 与 `semrelease1`](https://github.com/golang/go/blob/go1.26.2/src/runtime/sema.go#L146)
@@ -201,9 +201,34 @@ GMP scheduler
 
 ## 观测与验证
 
+下面的基准稳定制造同一把 Mutex 上的竞争，既能测量吞吐，也能生成有内容的 mutex profile：
+
+```go
+package syncbench
+
+import (
+	"sync"
+	"testing"
+)
+
+func BenchmarkMutexContention(b *testing.B) {
+	var mu sync.Mutex
+	var value uint64
+
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			mu.Lock()
+			value++
+			mu.Unlock()
+		}
+	})
+}
+```
+
 ```bash
 go test -race ./...
-go test -run '^$' -bench . -mutexprofile=mutex.out -blockprofile=block.out ./...
+go test -run '^$' -bench BenchmarkMutexContention -benchtime=3s \
+  -mutexprofile=mutex.out -blockprofile=block.out
 go tool pprof -http=:0 mutex.out
 go tool pprof -http=:0 block.out
 go test -trace=trace.out ./...
@@ -221,7 +246,7 @@ Mutex profile 归因的是 contention delay，不只是某次 `Lock` 自身的�
 
 ## 系列导航
 
+- [系列目录](/posts/go-runtime/)
 - [上一篇：Channel与Select](/posts/go-runtime-08-channel-select/)
 - 当前：Go Runtime（九）：Runtime信号量与同步原语
 - [下一篇：Timer实现](/posts/go-runtime-10-timer/)
-- [原始长文](/posts/go-runtime/)

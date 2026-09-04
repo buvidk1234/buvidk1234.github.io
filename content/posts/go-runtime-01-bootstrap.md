@@ -7,13 +7,13 @@ tags = ['Go', 'Runtime']
 
 > 本文源码基线为 **Go 1.26.2、Linux/amd64**。源码链接固定到 `go1.26.2` tag；其他操作系统、架构和构建模式的入口汇编会不同。
 
-Go runtime 是链接进 Go 可执行文件的一组基础设施。它不解释字节码，也不需要作为独立进程启动；它和编译器、标准库及操作系统共同实现 Go 的语言语义和执行模型。
+一个 Go 程序可以只有几行代码，但它的第一条指令并不属于 `main.main`。在用户函数开始前，可执行文件必须先建立线程本地状态、调度资源、栈和堆等运行环境。
 
-本文先建立 runtime 的模块边界，再从 Linux/amd64 可执行文件入口追踪到 `main.main`。后续文章分别沿调度、栈、分配、GC、Channel、同步、Timer 和系统集成深入。
+本文先从 ELF 入口这个可观察事实出发，再沿 Linux/amd64 启动链追踪到 `main.main`。重点不是背诵初始化函数，而是回答：每一步补上了什么运行前提，编译器、链接器、runtime 和操作系统各自负责哪一段。
 
-## Runtime解决什么问题
+## 一个最小Go程序
 
-一段普通 Go 程序表面上只包含函数调用、对象分配和 goroutine：
+以下程序表面上只有 goroutine、Channel 和一次函数返回：
 
 ```go
 package main
@@ -25,116 +25,47 @@ func main() {
 }
 ```
 
-但这些语法背后至少需要 runtime 完成以下工作：
-
-| 语法或行为 | Runtime职责 |
-| --- | --- |
-| `go f()` | 创建 G、准备初始栈、加入可运行队列 |
-| `new(T)`、`&T{}` | 按对象大小和指针信息分配内存 |
-| channel 收发 | 匹配发送方与接收方，必要时阻塞或唤醒 G |
-| 栈空间不足 | 分配更大连续栈，复制现场并修正栈内指针 |
-| 堆对象失去引用 | 并发标记、清扫和复用内存 |
-| 网络读写等待 | 将 G 挂起到 netpoll，fd 就绪后恢复运行 |
-| panic/defer/recover | 展开调用栈并按语言规则执行延迟调用 |
-
-因此，runtime 不是一个单独功能，而是支撑程序启动、调度、内存、GC、同步和系统交互的一组机制。
-
-## Runtime不是JVM
-
-Go 通常提前编译成本地机器码。程序运行时，CPU 直接执行这些机器指令；runtime 作为可执行文件的一部分提供底层服务。
-
-| 项目 | Go runtime | JVM |
-| --- | --- | --- |
-| 常见输入 | 本地机器码 | 字节码 |
-| 是否解释字节码 | 否 | 可以解释或 JIT 编译 |
-| 是否单独安装运行环境 | 通常不需要 | 通常需要 JVM |
-| 主要职责 | 调度、内存、GC、栈、系统集成 | 字节码执行、JIT、GC、类加载 |
-
-二者都包含 GC 等运行时能力，但执行模型不同。把 Go runtime 简单叫作“Go 虚拟机”会掩盖编译器、链接器与 runtime 之间的分工。
-
-## 整体架构
+这段程序的启动和运行依次经过编译、链接与操作系统装载。执行期间，runtime 把操作系统提供的线程、虚拟内存、信号和 I/O 事件转换成 Go 的调度、栈、堆和阻塞语义：
 
 ```text
-                        用户代码
-                           |
-                 编译器生成的调用和元数据
-                           |
-+----------------------------------------------------------+
-|                        Go runtime                        |
-|                                                          |
-|  启动       rt0 -> schedinit -> runtime.main             |
-|  调度       G / M / P / runq / work stealing            |
-|  栈         stack check / morestack / copystack          |
-|  分配       mcache / mcentral / mheap / arena            |
-|  GC         root scan / mark / barrier / sweep / pacer   |
-|  阻塞       gopark / goready / sema                      |
-|  系统集成   timer / netpoll / syscall / signal / cgo     |
-+----------------------------------------------------------+
-                           |
-              OS：线程、虚拟内存、信号、I/O事件
+Go源码
+  -> 编译器：机器码 + 类型/栈图/init task 等元数据
+  -> 链接器：用户包 + 标准库 + runtime -> ELF可执行文件
+  -> OS loader：建立初始线程和进程地址空间，跳到ELF入口
+  -> runtime启动：rt0 -> schedinit -> runtime.main
+       |
+       +-- 执行：G / M / P / runq
+       +-- 栈：stack check / morestack / copystack
+       +-- 内存：mcache / mcentral / mheap / GC
+       +-- 等待：gopark / goready / timer / netpoll / syscall
+  -> package init -> main.main
 ```
 
-模块不能割裂理解。`P` 不仅持有运行队列，也持有 `mcache` 和 timer；goroutine 栈既由调度器使用，也是 GC 根；网络 I/O 会经过 netpoll 挂起 G，再回到调度器；阻塞 syscall 则要求 M 暂时交出 P。
+这里没有一个独立安装、解释字节码的“Go 虚拟机”：CPU 执行的是提前编译并链接好的本地机器码，runtime 也是可执行文件的一部分。标准库提供稳定 API，并在内部接入 runtime，例如 `net.Conn` 通过 `internal/poll` 使用 netpoll，`sync` 通过 runtime 等待设施挂起和唤醒 G。
 
-## 三组核心对象
+几组对象把这些层连接起来：G 保存 goroutine 的栈、状态和现场，M 表示 OS 线程及其 runtime 上下文，P 提供执行 Go 代码的资格和本地资源。P 不只持有运行队列，还持有 `mcache`、timer 和 GC work；goroutine 栈同时又是 GC 根。因此调度、内存和系统交互必须作为同一个执行系统理解。
 
-### 执行对象
+## 先验证：ELF入口不是main.main
 
-```text
-G  goroutine 的运行状态、栈和调度现场
-M  OS 线程及其 runtime 上下文
-P  执行 Go 代码所需的资源和调度资格
+先记录实验环境，避免本机源码、在线链接和实际构建版本不一致：
+
+```bash
+go version
+go env GOROOT GOOS GOARCH GOEXPERIMENT CGO_ENABLED
 ```
 
-M 必须绑定 P 才能执行普通 Go 代码。P 的数量由 `GOMAXPROCS` 控制，也基本决定同一时刻最多有多少线程执行 Go 代码。
+把上面的程序保存为 `hello.go`，编译后查看 ELF 入口和几个关键符号：
 
-### 内存对象
-
-```text
-mcache    每个 P 的小对象分配缓存
-mcentral  某一 spanClass 的共享 span 集合
-mheap     全局页级堆和 arena 元数据
-mspan     一段连续页及其对象位图、清扫状态
+```bash
+go build -o hello ./hello.go
+readelf -h hello | grep 'Entry point'
+go tool nm hello | grep -E '(_rt0_amd64_linux|runtime.rt0_go|runtime.main|main.main)'
+go tool objdump -s 'runtime.rt0_go' hello
 ```
 
-小对象的常见分配路径是 `mcache -> mcentral -> mheap`，大对象通常直接从 `mheap` 获取页。
+`readelf` 给出的是装载器将跳转到的机器地址，`nm` 则能同时找到平台入口、`runtime.main` 和用户 `main.main`。它们不是同一个符号，这正是接下来要解释的现象：用户入口存在于二进制中，却要等 runtime 建立执行环境后才会被调用。
 
-### GC对象
-
-```text
-gcphase       当前 GC 阶段
-gcController  触发点、目标和 assist 比例
-gcWork        标记工作缓存
-write barrier 并发标记期间维护可达性
-```
-
-GC 与分配器形成闭环：分配速度推动 GC，GC 回收的 span 又回到分配器复用。
-
-## Runtime与其他组件的边界
-
-### 编译器
-
-编译器负责把语言结构降级成 runtime 能执行的形式，并生成类型、栈图等元数据。例如：
-
-```text
-go f()          -> 创建 goroutine 的 runtime 路径
-make(chan T)    -> channel 创建路径
-map/slice 操作  -> 内联代码或 runtime helper
-指针写入       -> 必要时插入写屏障
-函数入口       -> 栈空间检查
-```
-
-### 链接器
-
-链接器把用户代码、标准库和 runtime 组织为一个可执行文件，解析符号和重定位，并确定程序入口。程序不是先进入 `main.main`，而是先进入平台相关的 runtime 启动代码。
-
-### 标准库
-
-标准库提供稳定、可移植的 API，并在内部使用 runtime。例如 `net.Conn.Read` 经 `internal/poll` 接入 netpoll，`sync` 包通过 runtime 信号量完成阻塞和唤醒。
-
-### 操作系统
-
-操作系统只认识线程、虚拟内存、文件描述符、定时器和信号。runtime 把这些能力转换为 goroutine、Go 堆、网络轮询和异步抢占。
+本文的在线链接固定到 `go1.26.2`；本地阅读应确认 `$GOROOT/src/runtime` 来自同一版本。内部链接、外部链接、PIE、c-shared 等模式可能增加其他入口或 trampoline，以下主线只对应默认 Linux/amd64 可执行文件。
 
 ## 可执行文件为什么不从main.main开始
 
@@ -202,7 +133,7 @@ CALL runtime·mstart(SB)
 
 ## osinit与schedinit的边界
 
-[`osinit`](https://github.com/golang/go/blob/go1.26.2/src/runtime/os_linux.go#L353) 读取 CPU 数、物理页大小、进程亲和性或平台能力等 OS 信息。它必须早于调度器根据 CPU 情况确定初始 P 数量。
+[`osinit`](https://github.com/golang/go/blob/go1.26.2/src/runtime/os_linux.go#L353) 通过 `getCPUCount` 读取启动时可用 CPU 数（Linux 实现会考虑进程亲和性），并探测透明大页大小和 `vgetrandom` 能力。这里的 `physHugePageSize` 是 huge page 配置，不是普通物理页大小。`osinit` 必须早于调度器根据 CPU 情况确定初始 P 数量。
 
 [`schedinit`](https://github.com/golang/go/blob/go1.26.2/src/runtime/proc.go#L831) 名字叫“调度初始化”，实际建立的是大部分 runtime 基础设施。Go 1.26.2 中可以按依赖关系归纳为：
 
@@ -321,74 +252,17 @@ Linux ELF loader
 
 这条主线同时解释了编译器、链接器、runtime 和操作系统的分工：OS 只创建初始线程并跳进入口；链接器准备入口和 init 元数据；runtime 建立 Go 执行世界；用户 `main` 最后才获得控制权。
 
-## 启动源码验证方法
-
-先记录分析环境，避免本机源码、在线链接和实际构建版本不一致：
-
-```bash
-go version
-go env GOROOT GOOS GOARCH GOEXPERIMENT CGO_ENABLED
-```
-
-本文的在线链接固定到 `go1.26.2`；本地阅读应确认 `$GOROOT/src/runtime` 来自同一版本。仅设置 `GOOS/GOARCH` 不会自动让正在运行的操作系统行为变成目标平台，交叉编译结果和本机动态观测也要分开解释。
-
-可以编译最小程序并查看 ELF 入口与符号：
-
-```bash
-go build -o hello ./hello.go
-readelf -h hello | grep 'Entry point'
-go tool nm hello | grep -E '(_rt0_amd64_linux|runtime.rt0_go|runtime.main|main.main)'
-```
-
-再用 `go tool objdump -s 'runtime.rt0_go' hello` 查看链接后的启动汇编。启用内部链接、外部链接、PIE 或 c-shared 等模式时，入口和中间 trampoline 可能变化，文章主线只对应默认 Linux/amd64 可执行文件。
-
 ## 源码入口
 
-| 主题 | 主要文件 |
+| 目标 | 入口 |
 | --- | --- |
-| 启动和调度 | `runtime/proc.go`、`runtime/runtime2.go` |
-| 栈 | `runtime/stack.go`、`runtime/asm_*.s` |
-| 分配器 | `runtime/malloc.go`、`runtime/mheap.go` |
-| GC | `runtime/mgc.go`、`runtime/mgcmark.go` |
-| 阻塞唤醒 | `runtime/proc.go`、`runtime/sema.go` |
-| Channel与Select | `runtime/chan.go`、`runtime/select.go` |
-| 同步原语 | `runtime/sema.go`、`internal/sync/mutex.go`、`sync/*.go` |
-| Timer | `runtime/time.go`、`time/sleep.go` |
-| 网络轮询 | `runtime/netpoll.go`、`runtime/netpoll_*.go` |
-| 信号 | `runtime/signal_*.go`、`runtime/sigqueue.go` |
-| cgo | `runtime/cgocall.go`、`runtime/asm_*.s` |
+| Linux/amd64入口 | [`runtime/rt0_linux_amd64.s`](https://github.com/golang/go/blob/go1.26.2/src/runtime/rt0_linux_amd64.s) |
+| amd64启动汇编 | [`runtime/asm_amd64.s: rt0_go`](https://github.com/golang/go/blob/go1.26.2/src/runtime/asm_amd64.s#L175) |
+| 平台早期初始化 | [`runtime/os_linux.go: osinit`](https://github.com/golang/go/blob/go1.26.2/src/runtime/os_linux.go#L353) |
+| Runtime与main G初始化 | [`runtime/proc.go: schedinit/runtime.main`](https://github.com/golang/go/blob/go1.26.2/src/runtime/proc.go#L149) |
+| init task执行 | [`runtime/proc.go: doInit`](https://github.com/golang/go/blob/go1.26.2/src/runtime/proc.go#L8068) |
 
 阅读时应先锁定正在使用的 Go 版本。runtime 的函数名、字段和局部实现会变化，但“状态如何转换、资源归谁持有、阻塞后谁继续执行”这些主线相对稳定。
-
-## 推荐阅读路线
-
-文章编号保留了最初拆分和后续补篇的发布顺序，因此编号不完全等于源码依赖顺序。按依赖首次阅读，推荐路线是：
-
-```text
-01 架构与启动
-  -> 02 调度器
-  -> 03 栈
-  -> 04 分配器
-  -> 05 GC
-  -> 08 Channel与Select
-  -> 09 同步原语
-  -> 10 Timer
-  -> 06 Netpoll与Syscall
-  -> 07 Signal与cgo
-```
-
-各篇的阅读目标如下：
-
-1. [架构与启动](/posts/go-runtime-01-bootstrap/)：理解第一个 M、P、G 如何出现。
-2. [调度器](/posts/go-runtime-02-scheduler/)：理解 goroutine 如何创建、阻塞、恢复和抢占。
-3. [栈管理](/posts/go-runtime-03-stack/)：理解函数入口检查和连续栈搬迁。
-4. [分配器](/posts/go-runtime-04-allocator/)：理解堆对象、span、arena 和页分配。
-5. [GC](/posts/go-runtime-05-gc/)：理解对象如何被追踪和回收。
-6. [Netpoll 与 Syscall](/posts/go-runtime-06-netpoll-syscall/)：理解两类阻塞如何接入调度器。
-7. [Signal 与 cgo](/posts/go-runtime-07-signal-cgo/)：理解异步事件和外部线程如何进入 runtime。
-8. [Channel 与 Select](/posts/go-runtime-08-channel-select/)：理解值传递、等待队列和多路竞争。
-9. [Runtime 信号量与同步原语](/posts/go-runtime-09-sync-primitives/)：理解 Mutex、RWMutex、WaitGroup、Cond 和 Once 的阻塞底座。
-10. [Timer](/posts/go-runtime-10-timer/)：理解每 P 时间堆、Stop/Reset 竞态及其与 netpoll 的协作。
 
 ## 延伸阅读
 
@@ -397,6 +271,6 @@ go tool nm hello | grep -E '(_rt0_amd64_linux|runtime.rt0_go|runtime.main|main.m
 
 ## 系列导航
 
+- [系列目录](/posts/go-runtime/)
 - 当前：Go Runtime（一）：运行时架构与程序启动
 - [下一篇：GMP与Goroutine调度](/posts/go-runtime-02-scheduler/)
-- [原始长文](/posts/go-runtime/)

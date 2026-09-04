@@ -11,6 +11,56 @@ Go 调度器解决的核心问题是：怎样把大量 goroutine 映射到较少
 
 理解调度器不需要记住所有函数。先抓住三件事：执行资格属于 P，等待发生在 G 上，真正运行机器指令的是 M。
 
+## 先观察：两个P为什么会有更多线程
+
+下面的程序把 `GOMAXPROCS` 设为 2，同时制造 runnable G、Timer 和一个阻塞 syscall：
+
+```go
+package main
+
+import (
+	"runtime"
+	"syscall"
+	"time"
+)
+
+func main() {
+	runtime.GOMAXPROCS(2)
+	for range 20 {
+		go func() {
+			for {
+				runtime.Gosched()
+			}
+		}()
+	}
+
+	var pipe [2]int
+	if err := syscall.Pipe(pipe[:]); err != nil {
+		panic(err)
+	}
+	defer syscall.Close(pipe[0])
+	defer syscall.Close(pipe[1])
+
+	go func() {
+		var b [1]byte
+		_, _ = syscall.Read(pipe[0], b[:])
+	}()
+	time.AfterFunc(500*time.Millisecond, func() {
+		_, _ = syscall.Write(pipe[1], []byte{1})
+	})
+	time.Sleep(3 * time.Second)
+}
+```
+
+先构建再观察调度快照，避免把 `go run` 自身的编译进程混入输出：
+
+```bash
+go build -o schedlab ./main.go
+GODEBUG=schedtrace=1000,scheddetail=1 ./schedlab
+```
+
+输出中的 `gomaxprocs` 保持为 2，但线程总数可以更多；阻塞读取期间，其他 G 和 Timer 仍能取得进展。`GOMAXPROCS` 显然不等于线程上限，而“一个线程进入内核”也不等于“整个 Go 程序停止”。下面用 GMP、状态转换和 P 的交接解释这两个现象。快照只反映采样时刻，不能用来证明严格调度顺序。
+
 ## GMP模型
 
 ```text
@@ -114,6 +164,24 @@ func newproc(fn *funcval) {
 ```
 
 `systemstack` 说明创建过程在 g0 上完成；`runqput(..., true)` 表示优先尝试 runnext；`wakep` 只在启动完成后考虑唤醒额外 P。`newproc1` 通过 `gfget` 复用 `_Gdead`，必要时 `malg(stackMin)`，再设置 `sched.pc/sched.sp`、父 G、创建 PC、goid 和 trace 状态，最后发布为 `_Grunnable`。
+
+## 退出与复用
+
+`newproc1` 为新 G 准备的返回路径最终会进入 `goexit`。因此 goroutine 的入口函数正常返回后，不会回到创建它的 G，而是在当前 G 上执行退出协议：
+
+```text
+入口函数返回
+  -> goexit / goexit1
+  -> mcall(goexit0)：切到当前 M 的 g0
+  -> gdestroy
+       -> _Grunning -> _Gdead
+       -> 清理 M 关联、等待原因、defer/panic、Timer 等状态
+       -> 结算剩余 GC assist credit
+       -> gfput：放回当前 P 的空闲 G 列表
+  -> schedule
+```
+
+[`goexit1`、`goexit0` 与 `gdestroy`](https://github.com/golang/go/blob/go1.26.2/src/runtime/proc.go#L4474) 把退出和下一次调度放到 g0 上完成。`gfput` 保存可复用的 G，前一节创建路径中的 `gfget` 再从这里取回；被复用的是运行时描述符及合适大小的栈资源，不是上一次 goroutine 的用户状态。
 
 ## 从哪里找可运行的G
 
@@ -268,6 +336,8 @@ goroutine 进入可能阻塞的 syscall 时会切到 `_Gsyscall`。如果调用�
 
 这里理解 G/M/P 的所有权即可。`entersyscall`、`syscalltick`、`exitsyscall` 和 `RawSyscall` 的完整流程放在[第六篇：Netpoll与Syscall](/posts/go-runtime-06-netpoll-syscall/)，避免两篇重复解释同一机制。
 
+开篇实验中的 pipe 读取走的就是这条路径：M 可以继续阻塞在内核，P 则可被交给另一个 M，所以 Timer 和其他 runnable G 仍能运行；线程数也因此不受 P 数量直接限制。
+
 ## M如何休眠与被唤醒
 
 没有工作时，M 不能带着 P 直接睡眠。它先交出 P，再由 [`stopm`](https://github.com/golang/go/blob/go1.26.2/src/runtime/proc.go#L2992) 把自己放进 idle M 链表并睡在 note 上；被唤醒后从 `m.nextp` 取得已经移交给它的 P。
@@ -318,6 +388,7 @@ sched.gcwaiting = true，stopwait = gomaxprocs
 | --- | --- |
 | 核心结构 | [`runtime2.go`](https://github.com/golang/go/blob/go1.26.2/src/runtime/runtime2.go#L473) 中的 `g`、`m`、`p` |
 | 创建 G | [`newproc`、`newproc1`](https://github.com/golang/go/blob/go1.26.2/src/runtime/proc.go#L5295) |
+| 退出与复用 G | [`goexit1`、`goexit0`、`gdestroy`](https://github.com/golang/go/blob/go1.26.2/src/runtime/proc.go#L4474) |
 | 本地队列 | [`runqput`、`runqget`](https://github.com/golang/go/blob/go1.26.2/src/runtime/proc.go#L7478) |
 | 调度主线 | [`schedule`](https://github.com/golang/go/blob/go1.26.2/src/runtime/proc.go#L4135)、[`findRunnable`](https://github.com/golang/go/blob/go1.26.2/src/runtime/proc.go#L3389)、`execute` |
 | 阻塞唤醒 | [`gopark`、`goready`](https://github.com/golang/go/blob/go1.26.2/src/runtime/proc.go#L445)、`park_m`、`ready` |
@@ -327,52 +398,6 @@ sched.gcwaiting = true，stopwait = gomaxprocs
 | M/P休眠与唤醒 | [`stopm`、`startm`、`handoffp`、`wakep`](https://github.com/golang/go/blob/go1.26.2/src/runtime/proc.go#L2992) |
 | STW与死锁检测 | [`stopTheWorldWithSema`](https://github.com/golang/go/blob/go1.26.2/src/runtime/proc.go#L1628)、[`checkdead`](https://github.com/golang/go/blob/go1.26.2/src/runtime/proc.go#L6367) |
 
-## 可复现实验
-
-用下面的程序制造 runnable、timer 和 syscall 混合负载：
-
-```go
-package main
-
-import (
-	"runtime"
-	"syscall"
-	"time"
-)
-
-func main() {
-	runtime.GOMAXPROCS(2)
-	for range 20 {
-		go func() {
-			for {
-				runtime.Gosched()
-			}
-		}()
-	}
-	var pipe [2]int
-	if err := syscall.Pipe(pipe[:]); err != nil {
-		panic(err)
-	}
-	defer syscall.Close(pipe[0])
-	defer syscall.Close(pipe[1])
-
-	go func() {
-		var b [1]byte
-		_, _ = syscall.Read(pipe[0], b[:]) // 阻塞线程，供sysmon观察和retake
-	}()
-	time.AfterFunc(500*time.Millisecond, func() {
-		_, _ = syscall.Write(pipe[1], []byte{1})
-	})
-	time.Sleep(3 * time.Second)
-}
-```
-
-```bash
-GODEBUG=schedtrace=1000,scheddetail=1 go run main.go
-```
-
-该实验只适用于 Unix/Linux：它故意用阻塞 pipe 的原始 syscall 占住一个 M，再由 Timer 解除阻塞。重点观察 `gomaxprocs`、idle P、spinning thread、各 P 的 `runqsize` 和线程数变化。输出是采样快照，不能用单次结果证明严格调度顺序；需要结合 `go tool trace` 查看 G 状态转换和延迟分布。
-
 ## 延伸阅读
 
 - [Go语言调度器与Goroutine实现原理](https://draven.co/golang/docs/part3-runtime/ch06-concurrency/golang-goroutine/)：包含调度器演进背景；当前字段和流程需与 Go 1.26.2 对照。
@@ -380,7 +405,7 @@ GODEBUG=schedtrace=1000,scheddetail=1 go run main.go
 
 ## 系列导航
 
+- [系列目录](/posts/go-runtime/)
 - [上一篇：运行时架构与程序启动](/posts/go-runtime-01-bootstrap/)
 - 当前：Go Runtime（二）：GMP与Goroutine调度
 - [下一篇：Goroutine栈管理](/posts/go-runtime-03-stack/)
-- [原始长文](/posts/go-runtime/)

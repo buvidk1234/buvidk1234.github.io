@@ -7,13 +7,41 @@ tags = ['Go', 'Runtime', 'Channel', 'Select']
 
 > 本文源码基线为 **Go 1.26.2、Linux/amd64**。Channel 的语言语义跨平台一致；文中的字段、函数和行号固定到该版本，后续版本可能调整实现。
 
-Channel 不是“带锁队列”的同义词。它同时实现值传递、goroutine 阻塞与唤醒、`close` 广播、`select` 多路竞争，并且要和栈复制、GC、race detector、Timer 配合。
+Channel 不是“带锁队列”的同义词。它同时实现值传递、goroutine 阻塞与唤醒、`close` 广播、`select` 多路竞争，并且要和栈复制、GC、Timer 配合。
 
 理解 Channel 的关键，是区分三种正常数据路径：直接交接、环形缓冲区、等待队列。前两条可以立即完成；进入等待队列才会把当前 G 变为 `_Gwaiting`。nil Channel 的阻塞操作是没有数据路径的永久 park，属于另一个边界情况。
 
+## 公开语义与内存模型边界
+
+程序首先依赖的是语言契约，而不是 `hchan` 的字段。例如下面的读取不需要再给 `published` 加锁：
+
+```go
+var published int
+done := make(chan struct{})
+
+go func() {
+	published = 42
+	close(done)
+}()
+
+<-done
+fmt.Println(published) // 42
+```
+
+`close(done)` synchronized before 因关闭而返回的接收，所以接收之后能够观察到此前对 `published` 的写入。一般地，一次发送 synchronized before 对应接收完成；对容量为 C 的缓冲 Channel，第 k 次接收 synchronized before 第 k+C 次发送完成；当 C=0 时，还额外有接收发生在对应发送完成之前的保证。
+
+这些保证与 happens-before 一起建立内存可见性，但不承诺调度顺序：
+
+- goroutine 被唤醒后不保证立即获得 P。
+- 多个发送者不保证严格按墙上时间 FIFO 执行。
+- `select` 不保证在有限次数内选择每个持续就绪 case。
+- `len(ch)`、`cap(ch)` 只描述一次瞬时观察，不能替代同步。
+
+关闭后可以继续读完缓冲数据，随后接收元素零值和 `ok == false`；向已关闭 Channel 发送会 panic。nil Channel 的阻塞收发永远不能完成，但 nil case 可以用来动态禁用 `select` 分支。下文要解释的是 runtime 如何实现这些语义，而不是用私有队列顺序扩充语言契约。
+
 ## 从语法到runtime入口
 
-编译器把普通发送和接收分别降低为 `runtime.chansend1`、`runtime.chanrecv1/2`。非阻塞的单 case `select` 会被优化为 `selectnbsend` 或 `selectnbrecv`；多个有效 case 才构造 case 数组并调用 `runtime.selectgo`。
+编译器把普通发送和接收分别降低为 `runtime.chansend1`、`runtime.chanrecv1/2`。它会先特化无 case、单一通信 case，以及“一个通信 case + `default`”；最后一种使用 `selectnbsend` 或 `selectnbrecv`。其余通用 `select` 才构造 `scase` 和 order 数组并调用 `runtime.selectgo`，其中 Channel 在运行时为 nil 的 case 仍可能先进入数组。
 
 ```go
 ch <- x          // runtime.chansend1
@@ -26,7 +54,9 @@ close(ch)        // runtime.closechan
 
 源码入口：[`walk/select.go`](https://github.com/golang/go/blob/go1.26.2/src/cmd/compile/internal/walk/select.go#L56) 与 [`chan.go`](https://github.com/golang/go/blob/go1.26.2/src/runtime/chan.go#L159)。
 
-## hchan保存什么
+## 对象布局与等待描述
+
+### hchan保存什么
 
 [`hchan`](https://github.com/golang/go/blob/go1.26.2/src/runtime/chan.go#L34) 是 Channel 的运行时对象：
 
@@ -46,7 +76,7 @@ hchan
 
 源码维护两个重要不变量：通常 `sendq` 与 `recvq` 至少一个为空；对缓冲 Channel，`qcount > 0` 意味着没有等待接收者，`qcount < dataqsiz` 意味着没有等待发送者。无缓冲 Channel 在同一个 `select` 同时收发自身时存在特例。
 
-## makechan的三种分配方式
+### makechan的三种分配方式
 
 [`makechan`](https://github.com/golang/go/blob/go1.26.2/src/runtime/chan.go#L75) 先检查元素大小、对齐、容量乘法溢出和最大分配限制，再根据缓冲区布局选择分配方式：
 
@@ -58,7 +88,7 @@ hchan
 
 这里再次体现了分配器与 GC 的契约：是否含指针会改变对象布局，而不仅是扫描速度。
 
-## sudog连接G与等待对象
+### sudog连接G与等待对象
 
 Channel 等待队列不直接串联 `g`，而是串联 [`sudog`](https://github.com/golang/go/blob/go1.26.2/src/runtime/runtime2.go#L406)。同一个 G 在 `select` 中可以同时等待多个 Channel，因此“G 与同步对象”不是一对一关系。
 
@@ -72,7 +102,9 @@ G --waiting--> sudog --c--> hchan A
 
 `acquireSudog` 和 `releaseSudog` 使用缓存复用描述符，避免每次阻塞都产生普通堆分配。
 
-## 发送的四条路径
+## 收发、阻塞与关闭
+
+### 发送的四条路径
 
 [`chansend`](https://github.com/golang/go/blob/go1.26.2/src/runtime/chan.go#L176) 的主线是：
 
@@ -95,7 +127,7 @@ lock(hchan)
 
 阻塞发送者在入队前把元素地址写进 `sudog`，把 `sudog` 挂到 `g.waiting`，设置 `parkingOnChan`，再通过 `gopark(chanparkcommit, &c.lock, ...)` 原子提交 park 并解锁。醒来后根据 `sudog.success` 判断操作成功还是因为 `close` 而失败。
 
-## 接收的四条路径
+### 接收的四条路径
 
 [`chanrecv`](https://github.com/golang/go/blob/go1.26.2/src/runtime/chan.go#L524) 与发送并非完全镜像：
 
@@ -118,13 +150,13 @@ lock(hchan)
 
 关闭后仍可读完缓冲区；只有“已关闭且缓冲区为空”才返回元素零值和 `ok == false`。因此 `closed` 与 `qcount` 必须一起判断。
 
-## 为什么快速路径可以不加锁
+### 为什么快速路径可以不加锁
 
 非阻塞发送先观察 `closed == 0` 和 `full(c)`；非阻塞接收先观察 `empty(c)`，再用原子读检查 `closed` 并在必要时复查空状态。这些读只能证明“曾存在一个操作无法立即完成的时刻”，不能承诺下一条指令看到相同状态。
 
 所以 `len(ch)`、`cap(ch)` 和非阻塞探测只能用于即时决策，不能当成随后操作仍安全的同步证明。内存顺序论证直接写在 [`chansend`](https://github.com/golang/go/blob/go1.26.2/src/runtime/chan.go#L197) 和 [`chanrecv`](https://github.com/golang/go/blob/go1.26.2/src/runtime/chan.go#L548) 的注释中。
 
-## park与栈复制的交界
+### park与栈复制的交界
 
 Channel 锁保护 `hchan` 字段以及队列中部分 `sudog` 字段，但源码特别禁止持有该锁时直接改变另一个 G 的状态。原因是栈缩小可能持有 G 相关状态并尝试获取 Channel 锁；反向持锁再 `goready` 会形成死锁。
 
@@ -138,7 +170,7 @@ Channel 锁保护 `hchan` 字段以及队列中部分 `sudog` 字段，但源码
 
 `parkingOnChan` 与 `activeStackChans` 则关闭“已经转入 waiting，但栈指针尚未处于可安全修正状态”的窗口。这正是栈管理篇中 `copystack` 必须理解 Channel wait list 的原因。
 
-## close是一次批量唤醒
+### close是一次批量唤醒
 
 [`closechan`](https://github.com/golang/go/blob/go1.26.2/src/runtime/chan.go#L414) 在锁内完成三件事：设置 `closed`；清零所有等待接收者的目标并标记失败；把所有等待发送者标记为失败。它将待唤醒 G 收集到临时 `gList`，解锁后统一 `goready`。
 
@@ -146,7 +178,9 @@ Channel 锁保护 `hchan` 字段以及队列中部分 `sudog` 字段，但源码
 
 这也解释了为什么关闭是广播，而向 Channel 发送一个零值不是：零值仍是一条普通数据，关闭则改变对象的永久状态并唤醒全部两类等待者。
 
-## selectgo为什么需要两个顺序
+## Select的原子决策
+
+### selectgo为什么需要两个顺序
 
 [`selectgo`](https://github.com/golang/go/blob/go1.26.2/src/runtime/select.go#L122) 为有效 case 构造两个顺序：
 
@@ -157,7 +191,7 @@ Channel 锁保护 `hchan` 字段以及队列中部分 `sudog` 字段，但源码
 
 “随机”只用于候选 case 的选择公平性；“确定”用于并发加锁安全性，两者不能混为一谈。
 
-## select的三轮协议
+### select的三轮协议
 
 持有所有相关 Channel 锁后，`selectgo` 执行三轮协议：
 
@@ -175,7 +209,7 @@ random poll -> no ready case
 
 等待队列的 [`dequeue`](https://github.com/golang/go/blob/go1.26.2/src/runtime/chan.go#L886) 对 `select` 节点执行 `g.selectDone.CompareAndSwap(0, 1)`。CAS 只有一个赢家；其他 Channel 即使同时就绪，也会跳过已经输掉竞争的 `sudog`。这解决的是“多个唤醒者竞争同一个 G”，不是语言层面的 case 随机化。
 
-## nil Channel为何有用
+### nil Channel为何有用
 
 对 nil Channel 的阻塞收发会永久 park，但 `selectgo` 会把 Channel 为 nil 的 case 从 poll 和 lock 顺序中删掉。因此把某个 Channel 变量设为 nil，可以动态禁用对应 case：
 
@@ -196,26 +230,11 @@ for in != nil || out != nil {
 
 若所有 case 都被禁用且没有 `default`，整个 `select` 永久阻塞。这不是特殊语法规则，而是“没有可入队的有效 Channel + block=true”的自然结果。
 
-## Channel与Timer的连接
+### Channel与Timer的连接
 
 Go 1.26 的 `hchan.timer` 允许 Timer Channel 参与 Channel 快速路径和 `select`。读取或构造 `pollorder` 时可能调用 [`maybeRunChan`](https://github.com/golang/go/blob/go1.26.2/src/runtime/time.go#L1442)；阻塞/退出 `select` 时调用 `blockTimerChan`、`unblockTimerChan` 维护真正等待该 Timer Channel 的 G 数量。
 
 这套按需挂入 Timer heap 的机制是 Go 1.23 同步 Timer Channel 语义的一部分，详细流程放在第十篇。
-
-## 内存模型与公平性的边界
-
-Channel 的同步保证来自语言内存模型：一次发送 synchronized before 对应接收完成；关闭 synchronized before 某次接收因为关闭而返回零值。对容量为 C 的缓冲 Channel，第 k 次接收 synchronized before 第 k+C 次发送完成；当 C=0 时，还额外有接收发生在对应发送完成之前的保证。
-
-这里刻意使用规范中的 synchronized before：它与 happens-before 一起建立内存可见性，不代表发送方和接收方按墙上时间立即切换，也不规定调度队列顺序。
-
-这些保证不等于：
-
-- goroutine 被唤醒后立即获得 P。
-- 多个发送者严格按墙上时间 FIFO 执行。
-- `select` 在有限次数内必然选择每个持续就绪 case。
-- `len(ch)` 可以替代同步。
-
-运行时队列、随机轮询和调度器共同提供工程上的公平性，但语言规范没有承诺严格实时调度。
 
 ## 源码阅读顺序
 
@@ -229,7 +248,7 @@ Channel 的同步保证来自语言内存模型：一次发送 synchronized befo
 
 ## 观测与验证
 
-阻塞 profile 可以定位 Channel 等待时间：
+用同一条生产者 -> worker -> 消费者 pipeline 作为实验主体：先使用无缓冲 Channel，再把容量改成 1 和更大的值；随后加入 `close`、超时 case，并在输入结束时把对应 Channel 变量设为 nil。输出序列验证公开语义，trace 和阻塞 profile 则区分直接交接、缓冲完成与真正 park。阻塞 profile 可以定位 Channel 等待时间：
 
 ```bash
 go test -run '^$' -bench . -blockprofile=block.out ./...
@@ -250,7 +269,7 @@ go tool trace trace.out
 
 ## 系列导航
 
+- [系列目录](/posts/go-runtime/)
 - [上一篇：Signal与cgo线程管理](/posts/go-runtime-07-signal-cgo/)
 - 当前：Go Runtime（八）：Channel与Select
 - [下一篇：Runtime信号量与同步原语](/posts/go-runtime-09-sync-primitives/)
-- [原始长文](/posts/go-runtime/)
